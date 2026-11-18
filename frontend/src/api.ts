@@ -43,7 +43,8 @@ export interface Stats {
   straight_through_rate: number | null
 }
 export interface Config {
-  engines: Record<string, boolean>; models: Record<string, string>; graph_configured: boolean
+  engines: Record<string, boolean>; graph_configured: boolean
+  azure: { read_enabled: boolean; highres_fallback: boolean; cost_per_page: { read: number; invoice: number; highres_addon: number } }
   graph_poll_enabled: boolean; accept_confidence: number; max_cost_per_document_usd: number
 }
 

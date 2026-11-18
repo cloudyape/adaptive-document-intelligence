@@ -120,16 +120,25 @@ def process_document(session: Session, doc_id: int, orchestrator: Orchestrator |
     return doc
 
 
+# Characters OCR commonly confuses, folded to one canonical form for duplicate matching.
+_OCR_FOLD = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "|": "1", "S": "5", "B": "8", "Z": "2", "G": "6"})
+
+
+def number_key(number: str) -> str:
+    """Comparable form of a document number: case-, separator- and OCR-confusion-insensitive."""
+    return "".join(ch for ch in number.upper().translate(_OCR_FOLD) if ch.isalnum())
+
+
 def find_duplicate(session: Session, doc: Document) -> int | None:
-    """Another non-rejected document with the same vendor (GSTIN, else name) and document number."""
+    """Another non-rejected document from the same vendor (GSTIN, else name) with the same number."""
     rec = doc.record
     if rec is None or not rec.document_number:
         return None
     session.flush()
-    stmt = select(FinancialRecord.document_id).join(Document).where(
+    stmt = select(FinancialRecord.document_id, FinancialRecord.document_number).join(Document).where(
         FinancialRecord.document_id != doc.id,
         FinancialRecord.doc_type == rec.doc_type,
-        func.lower(FinancialRecord.document_number) == rec.document_number.lower(),
+        FinancialRecord.document_number.is_not(None),
         Document.status != DocStatus.REJECTED,
     )
     if rec.vendor_gstin:
@@ -138,7 +147,11 @@ def find_duplicate(session: Session, doc: Document) -> int | None:
         stmt = stmt.where(func.lower(FinancialRecord.vendor_name) == rec.vendor_name.lower())
     else:
         return None
-    return session.scalar(stmt.order_by(FinancialRecord.document_id).limit(1))
+    key = number_key(rec.document_number)
+    for other_id, other_number in session.execute(stmt.order_by(FinancialRecord.document_id)):
+        if number_key(other_number) == key:
+            return other_id
+    return None
 
 
 def _upsert_record(session: Session, doc: Document, data: ExtractedDocument, *, verified_by: str | None = None) -> FinancialRecord:

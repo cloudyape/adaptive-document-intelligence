@@ -1,7 +1,7 @@
 """Is this a financial document, and which kind?
 
-Cheap keyword scoring over filename, email subject and document text decides most cases.
-Only when the score is ambiguous do we ask a small LLM (Haiku) to triage.
+Weighted keyword scoring over filename, email subject and document text. Ambiguous documents keep
+the best-guess type at low confidence, so they are still extracted and land in review if wrong.
 """
 from __future__ import annotations
 
@@ -9,10 +9,6 @@ import logging
 import re
 from dataclasses import dataclass
 
-from pydantic import BaseModel
-
-from app.config import get_settings
-from app.pipeline import llm
 from app.schemas import DocType
 
 log = logging.getLogger(__name__)
@@ -39,13 +35,8 @@ NEGATIVE = [r"\bnewsletter\b", r"\bunsubscribe\b", r"\bresume\b|\bcurriculum vit
 class Identification:
     doc_type: DocType
     confidence: float
-    method: str  # keywords | llm
+    method: str  # keywords
     scores: dict[str, float]
-
-
-class _Triage(BaseModel):
-    document_type: DocType
-    confidence: float
 
 
 def _score(text: str, weight: float, scores: dict[DocType, float]) -> None:
@@ -74,23 +65,7 @@ def identify(text: str, filename: str = "", subject: str = "") -> Identification
     if best_score == 0 and financial <= 1:
         return Identification(DocType.OTHER, 0.8 if text.strip() else 0.3, "keywords", raw)
 
-    # Ambiguous: ask a small model if available, otherwise take the keyword best guess.
-    settings = get_settings()
-    if settings.llm_enabled and llm.available() and text.strip():
-        try:
-            triage, _usage = llm.parse(
-                model=settings.model_classifier,
-                system="You triage business documents. Decide which financial document type this is. "
-                "Use 'other' for anything that is not an invoice, quotation, proforma invoice, credit/debit note, "
-                "or purchase order (e.g. statements, reminders, marketing, contracts).",
-                content=[{"type": "text", "text": f"Filename: {filename}\nEmail subject: {subject}\n\n{text[:4000]}"}],
-                output_model=_Triage,
-                max_tokens=512,
-            )
-            return Identification(triage.document_type, round(triage.confidence, 2), "llm", raw)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("LLM triage failed, using keyword guess: %s", exc)
-
+    # Ambiguous: keep the keyword best guess at reduced confidence.
     if best_score > 0:
         return Identification(best, round(min(0.7, 0.3 + 0.05 * best_score), 2), "keywords", raw)
     return Identification(DocType.OTHER, 0.4, "keywords", raw)

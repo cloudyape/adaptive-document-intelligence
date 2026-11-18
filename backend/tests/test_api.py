@@ -51,10 +51,10 @@ def test_non_financial_is_ignored(client, sample_dir):
     assert client.get(f"/api/documents/{d['id']}").json()["status"] == "ignored"
 
 
-def test_scanned_without_llm_goes_to_review_then_human_corrects(client, sample_dir):
+def test_scanned_without_ocr_or_azure_goes_to_review_then_human_corrects(client, sample_dir):
     d = upload(client, sample_dir / "invoice_scanned.pdf", "application/pdf")
     doc = client.get(f"/api/documents/{d['id']}").json()
-    # No OCR binary and LLMs disabled in tests -> every engine is skipped -> human review
+    # No OCR binary on the test host and no Azure configured -> every engine is skipped -> human review
     assert doc["status"] == "needs_review"
     assert d["id"] in [x["id"] for x in client.get("/api/review-queue").json()["items"]]
 
