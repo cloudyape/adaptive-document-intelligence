@@ -22,27 +22,26 @@ class Settings(BaseSettings):
     graph_poll_seconds: int = 300
     graph_max_messages_per_run: int = 50
 
-    # --- Claude (LLM tiers). Credentials: ANTHROPIC_API_KEY or an `ant auth login` profile. ---
-    llm_enabled: bool = True
-    model_classifier: str = "claude-haiku-5-5"  # doc-type triage when keywords are ambiguous
-    model_ocr_llm: str = "claude-haiku-5-5"  # MEDIUM tier: OCR text / page images -> JSON
-    model_document_ai: str = "claude-sonnet-5-5"  # DIFFICULT tier when Azure DI isn't configured
-    model_fallback: str = "claude-opus-5-5"  # last automatic resort before a human
-
-    # --- Azure AI Document Intelligence (optional DIFFICULT-tier engine) ---
-    azure_di_endpoint: str | None = None
+    # --- Azure AI Document Intelligence (the only paid engine; tiers 3-5) ---
+    azure_di_endpoint: str | None = None  # https://<resource>.cognitiveservices.azure.com
     azure_di_key: str | None = None
-    azure_di_cost_per_page: float = 0.01
+    azure_di_api_version: str = "2024-11-30"
+    azure_di_read_enabled: bool = True  # tier 3: prebuilt-read OCR + local rules (cheapest Azure call)
+    azure_di_highres_fallback: bool = True  # tier 5: prebuilt-invoice + ocrHighResolution add-on
+    # Per-page list prices in USD. Defaults are placeholders: set them from your Azure pricing / portal.
+    azure_di_read_cost_per_page: float = 0.0015
+    azure_di_invoice_cost_per_page: float = 0.01
+    azure_di_highres_cost_per_page: float = 0.006  # add-on, charged on top of the invoice model
+    azure_di_timeout_seconds: int = 120
 
     # --- OCR / rendering ---
     tesseract_cmd: str | None = None  # autodetected on PATH when unset
     render_dpi: int = 200
-    max_pages_for_vision: int = 20
 
     # --- Orchestration thresholds ---
     accept_confidence: float = 0.85  # accept an engine's result at/above this validation score
     amount_tolerance: float = 1.0  # absolute currency tolerance for arithmetic checks
-    max_cost_per_document_usd: float = 0.50  # stop escalating once a document has cost this much
+    max_cost_per_document_usd: float = 0.25  # stop escalating once a document has cost this much
 
 
 @lru_cache

@@ -5,7 +5,8 @@ from pathlib import Path
 _tmp = Path(tempfile.mkdtemp(prefix="adi-test-"))
 os.environ["ADI_DATABASE_URL"] = f"sqlite:///{_tmp / 'test.db'}"
 os.environ["ADI_STORAGE_DIR"] = str(_tmp / "storage")
-os.environ["ADI_LLM_ENABLED"] = "false"  # tests never call paid APIs; LLM engines are faked
+os.environ.pop("ADI_AZURE_DI_ENDPOINT", None)  # tests never call Azure; its HTTP is mocked
+os.environ.pop("ADI_AZURE_DI_KEY", None)
 
 import pytest  # noqa: E402
 

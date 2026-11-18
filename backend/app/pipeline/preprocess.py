@@ -104,7 +104,7 @@ class DocumentContext:
                 import pypdfium2 as pdfium
 
                 pdf = pdfium.PdfDocument(str(self.path))
-                limit = get_settings().max_pages_for_vision
+                limit = 50  # rendering is only for quality checks and OCR; cap memory use
                 self._page_images = [
                     pdf[i].render(scale=dpi / 72).to_pil().convert("RGB") for i in range(min(len(pdf), limit))
                 ]
@@ -151,24 +151,122 @@ def _garbled_ratio(text: str) -> float:
     return bad / len(tokens)
 
 
-def _ocr_image(img: Image.Image) -> tuple[str, float | None]:
+def remove_ruling_lines(gray: Image.Image) -> Image.Image:
+    """Erase long horizontal/vertical dark runs (table grid lines) so Tesseract reads cells as text.
+
+    Without this, ruled invoice tables are mostly dropped or read as noise.
+    """
+    import numpy as np
+
+    a = np.array(gray)
+    dark = a < 128
+    h, w = dark.shape
+
+    def long_runs(mask: "np.ndarray", min_len: int) -> "np.ndarray":
+        padded = np.pad(mask.astype(np.int8), ((0, 0), (1, 1)))
+        diff = np.diff(padded, axis=1)
+        res = np.zeros_like(mask)
+        for r, c in zip(*np.nonzero(diff == 1)):
+            end = c + np.argmax(diff[r, c + 1:] == -1) + 1
+            if end - c >= min_len:
+                res[r, c:end] = True
+        return res
+
+    lines = long_runs(dark, max(60, int(w * 0.08))) | long_runs(dark.T, max(40, int(h * 0.03))).T
+    a = a.copy()
+    a[lines] = 255
+    return Image.fromarray(a)
+
+
+def _rows_from_words(data: dict) -> str:
+    """Rebuild visual text lines by vertical position.
+
+    Tesseract's own block/line grouping reads multi-column layouts column by column, separating
+    labels ("Grand Total") from their amounts. Grouping words by y-centre restores label/value rows.
+    """
+    words = [(data["top"][i] + data["height"][i] / 2, data["left"][i], data["height"][i], w)
+             for i, w in enumerate(data["text"]) if w.strip()]
+    if not words:
+        return ""
+    heights = sorted(h for _, _, h, _ in words)
+    tol = heights[len(heights) // 2] * 0.6
+    words.sort()
+    rows: list[list[tuple[int, str]]] = []
+    centres: list[float] = []  # running mean y of each row
+    for y, x, _h, w in words:
+        if centres and abs(y - centres[-1]) <= tol:
+            rows[-1].append((x, w))
+            centres[-1] += (y - centres[-1]) / len(rows[-1])
+        else:
+            rows.append([(x, w)])
+            centres.append(y)
+    return "\n".join(" ".join(w for _, w in sorted(r)) for r in rows)
+
+
+def deskew(gray: Image.Image, max_angle: float = 3.0, step: float = 0.25) -> tuple[Image.Image, float]:
+    """Rotate so text lines are horizontal: pick the angle that maximises row-profile variance."""
+    import numpy as np
+
+    small = gray.copy()
+    small.thumbnail((900, 900))
+    best_angle, best_score = 0.0, -1.0
+    for angle in np.arange(-max_angle, max_angle + step / 2, step):
+        rotated = np.array(small.rotate(float(angle), fillcolor=255, resample=Image.Resampling.NEAREST))
+        profile = (rotated < 128).sum(axis=1).astype(float)
+        score = profile.var()
+        if score > best_score:
+            best_angle, best_score = float(angle), score
+    if abs(best_angle) < step / 2:
+        return gray, 0.0
+    return gray.rotate(best_angle, fillcolor=255, resample=Image.Resampling.BICUBIC, expand=False), best_angle
+
+
+def binarize_and_strip_lines(gray: Image.Image, threshold: int = 170, widen: int = 2) -> Image.Image:
+    """Hard black/white, then erase grid lines plus a margin (removes anti-aliased line ghosts)."""
+    import numpy as np
+
+    bw = gray.point(lambda p: 255 if p > threshold else 0)
+    a = np.array(bw)
+    lines = (a < 128) & (np.array(remove_ruling_lines(bw)) == 255)
+    grown = lines.copy()
+    for d in range(1, widen + 1):
+        for axis in (0, 1):
+            grown |= np.roll(lines, d, axis=axis) | np.roll(lines, -d, axis=axis)
+    a = a.copy()
+    a[grown] = 255
+    return Image.fromarray(a)
+
+
+# Preprocessing variants for local OCR. Which one reads a given scan best varies, so the local OCR
+# engine tries them in order and keeps the result that validates best (CPU only, still free).
+OCR_VARIANTS = {
+    "lines_removed": lambda g: remove_ruling_lines(g),
+    "binarized": lambda g: binarize_and_strip_lines(g),
+    "deskewed": lambda g: remove_ruling_lines(deskew(g)[0]),
+    "deskewed_binarized": lambda g: binarize_and_strip_lines(deskew(g)[0]),
+}
+
+
+def _ocr_image(img: Image.Image, variant: str = "lines_removed") -> tuple[str, float | None]:
     import pytesseract
 
-    gray = img.convert("L")
-    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
-    words, confs = [], []
-    lines: dict[tuple, list[str]] = {}
-    for i, word in enumerate(data["text"]):
-        if not word.strip():
-            continue
-        conf = float(data["conf"][i])
-        if conf >= 0:
-            confs.append(conf)
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        lines.setdefault(key, []).append(word)
-        words.append(word)
-    text = "\n".join(" ".join(ws) for ws in lines.values())
-    return text, (sum(confs) / len(confs) if confs else None)
+    clean = OCR_VARIANTS[variant](img.convert("L"))
+    data = pytesseract.image_to_data(clean, config="--psm 3", output_type=pytesseract.Output.DICT)
+    confs = [float(c) for c, w in zip(data["conf"], data["text"]) if w.strip() and float(c) >= 0]
+    return _rows_from_words(data), (sum(confs) / len(confs) if confs else None)
+
+
+def ocr_variant_pages(ctx: "DocumentContext", variant: str) -> list[PageInfo]:
+    """Re-OCR the pages that needed OCR with another preprocessing variant; text-layer pages are kept."""
+    images = ctx.page_images()
+    pages = []
+    for p in ctx.pages:
+        if p.text_source == "ocr" and p.number - 1 < len(images):
+            text, conf = _ocr_image(images[p.number - 1], variant)
+            pages.append(PageInfo(p.number, text, "ocr", conf, p.image_coverage, p.table_count, p.tables))
+        else:
+            pages.append(p)
+    return pages
 
 
 def analyze(path: Path, mime_type: str, filename: str) -> DocumentContext:

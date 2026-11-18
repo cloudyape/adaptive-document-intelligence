@@ -17,8 +17,7 @@ onMounted(() => { refreshCount(); setInterval(refreshCount, 15000) })
   <div class="min-h-screen md:flex">
     <aside class="border-b border-slate-200 bg-white md:w-60 md:shrink-0 md:border-b-0 md:border-r">
       <div class="px-5 py-4">
-        <div class="text-lg font-semibold tracking-tight">ADI</div>
-        <div class="text-xs text-slate-500">Adaptive Document Intelligence</div>
+        <div class="text-lg font-semibold tracking-tight">Dealer Quote Parsing</div>
       </div>
       <nav class="flex gap-1 overflow-x-auto px-3 pb-3 md:flex-col">
         <RouterLink v-for="n in nav" :key="n.to" :to="n.to"

@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: adi
       POSTGRES_DB: adi
     volumes: [pgdata:/var/lib/postgresql/data]
-    ports: ["5432:5432"]
+    ports: ["${ADI_DB_HOST_PORT:-5434}:5432"]  # host port only for psql/GUI access; backend uses the internal network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U adi"]
       interval: 5s

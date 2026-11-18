@@ -143,5 +143,6 @@ def validate(doc: ExtractedDocument, engine_confidence: float = 0.5) -> Validati
     penalty = sum(PENALTY[i.severity] for i in issues)
     validation_score = max(0.0, 1.0 - penalty)
     score = round(0.8 * validation_score + 0.2 * engine_confidence, 3)
-    passed = not any(i.severity == "critical" for i in issues) and score >= get_settings().accept_confidence
+    # Auto-accept only clean results: any critical or error issue means escalate (or human review).
+    passed = not any(i.severity in ("critical", "error") for i in issues) and score >= get_settings().accept_confidence
     return ValidationReport(score=score, passed=passed, issues=issues, checks_run=checks)

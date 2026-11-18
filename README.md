@@ -1,18 +1,20 @@
-# Adaptive Document Intelligence (ADI)
+# Dealer Quote Parsing
 
 Pulls invoices and quotations from Outlook, decides how hard each one is to extract, and sends it to the
-**cheapest engine that can handle it**. Every result is validated, a failed extraction moves up to a
-stronger engine, and whatever still fails goes to a person for review. The output is standardized
+**cheapest engine that can handle it**. Easy and medium documents are handled locally for free. Azure AI
+Document Intelligence, the only paid service, is called only when the local engines can't produce a
+result that passes validation. Whatever still fails goes to a person for review. The output is standardized
 financial data in PostgreSQL, available through a REST API and a Vue dashboard.
 
 ```
 Outlook ──Graph──▶ identify ──▶ classify complexity ──▶ route ──▶ validate ──▶ PostgreSQL ──▶ API / dashboard
                   (invoice?      (easy/medium/          │            │  fail
                    quotation?)    difficult)            ▼            ▼
-                                             ┌── T1 rules engine ──── free
-                                             ├── T2 OCR + Haiku ───── fractions of a cent
-                                             ├── T3 Azure DI / Claude Sonnet vision
-                                             └── T4 Claude Opus fallback (sees earlier errors)
+                                             ┌── T1 rules on PDF text layer ─────── free (local)
+                                             ├── T2 Tesseract OCR + rules ───────── free (local)
+                                             ├── T3 Azure DI prebuilt-read + rules ─ cheapest Azure call
+                                             ├── T4 Azure DI prebuilt-invoice
+                                             └── T5 prebuilt-invoice + high-res OCR, merged with T1-T4
                                                         │ still failing
                                                         ▼
                                                   human review queue
@@ -22,9 +24,9 @@ Outlook ──Graph──▶ identify ──▶ classify complexity ──▶ ro
 
 | Complexity | Typical document | First engine | Escalates to |
 |---|---|---|---|
-| Easy | Digital PDF with a text layer, HTML email body | `rules`: label patterns + pdfplumber tables, $0 | T2 → T3 → T4 |
-| Medium | Clean scan or photo, long digital docs | `ocr_llm`: Tesseract text → Claude Haiku (page images if there's no OCR) | T3 → T4 |
-| Difficult | Handwriting, poor scans, low OCR confidence, unsupported formats | `azure_di` (if configured), else `claude_vision` (Sonnet reads the PDF/images) | T4 |
+| Easy | Digital PDF with a text layer, HTML email body | `rules`: label patterns + pdfplumber tables, $0 | T2 → T3 → T4 → T5 |
+| Medium | Clean scan or photo, long digital docs | `local_ocr`: Tesseract text → rules, $0 | T3 → T4 → T5 |
+| Difficult | Handwriting, poor scans, low OCR confidence, unsupported formats | `azure_invoice`: Azure's prebuilt invoice model | T5 |
 
 - **The complexity score is explainable.** [complexity.py](backend/app/pipeline/complexity.py) adds points for
   features it measures locally: no text layer, OCR confidence, garbled-token ratio, page count, tables, and
@@ -32,9 +34,15 @@ Outlook ──Graph──▶ identify ──▶ classify complexity ──▶ ro
 - **Validation decides acceptance, not the engine's own confidence.** [validation.py](backend/app/pipeline/validation.py)
   checks required fields, ISO dates, the GSTIN mod-36 checksum, qty × price = amount, line sum = subtotal,
   subtotal − discount + tax + other = total, CGST = SGST, and IGST vs CGST/SGST against the place of supply.
-  A result is accepted only with no critical issues and a score ≥ `ADI_ACCEPT_CONFIDENCE` (0.85).
-- **Escalation carries context.** The Opus fallback gets the best earlier attempt plus its validation errors.
-- **Spend is capped.** Escalation stops at `ADI_MAX_COST_PER_DOCUMENT_USD`. Every attempt's tokens and cost are recorded.
+  A result is accepted only with no critical or error issues (warnings are allowed) and a score ≥
+  `ADI_ACCEPT_CONFIDENCE` (0.85).
+- **Azure output is combined with local rules.** Azure's invoice model has no CGST/SGST/IGST split, no quotation
+  validity date, and no GSTIN check. The system runs its India-aware rules over the text Azure recognised and fills those
+  gaps at no extra cost. The tier-5 fallback also merges in whatever tiers 1–4 got right.
+- **Spend is capped.** Escalation stops at `ADI_MAX_COST_PER_DOCUMENT_USD`, and every attempt's cost is recorded.
+  Azure per-page prices are settings (`ADI_AZURE_DI_*_COST_PER_PAGE`). The defaults are placeholders, so set them
+  from your Azure pricing.
+- **Without Azure configured**, tiers 3–5 are skipped and anything the local engines can't validate goes to review.
 - **Dedupe.** Files are deduplicated by SHA-256. A document with the same vendor and number as an earlier one
   is flagged as a possible duplicate.
 
@@ -43,7 +51,7 @@ Outlook ──Graph──▶ identify ──▶ classify complexity ──▶ ro
 **With Docker** (PostgreSQL + API + dashboard at http://localhost:8080):
 
 ```bash
-cp .env.example .env   # add ANTHROPIC_API_KEY and the ADI_GRAPH_* values
+cp .env.example .env   # add ADI_AZURE_DI_ENDPOINT / ADI_AZURE_DI_KEY and the ADI_GRAPH_* values
 docker compose up --build
 ```
 
@@ -64,7 +72,7 @@ Generate sample documents to upload (digital invoice, quotation, scanned invoice
 cd backend && .venv/bin/python -m tests.samples ../samples
 ```
 
-Tests (no paid API calls; the LLM engines are faked):
+Tests (no paid API calls; Azure's REST API is mocked):
 
 ```bash
 cd backend && .venv/bin/python -m pytest -q
@@ -106,7 +114,7 @@ Interactive docs are at `/docs`.
 backend/app/
   ingestion/      graph.py (Graph client, throttling, large attachments), service.py (email → documents)
   pipeline/       preprocess.py (text layer, OCR, features), identify.py, complexity.py,
-                  engines/{rules,claude,azure_di}.py, validation.py, orchestrator.py, llm.py
+                  engines/{rules,azure_di}.py, merge.py, validation.py, orchestrator.py
   service.py      persistence: store, process, review, duplicate detection
   api/main.py     FastAPI
 frontend/src/     Vue 3 + Tailwind v4: Overview, Documents, Document detail/review, Review queue, Records
@@ -117,5 +125,8 @@ frontend/src/     Vue 3 + Tailwind v4: Overview, Documents, Document detail/revi
 - Tables are created with `create_all` on startup. Add Alembic before the first production schema change.
 - Processing runs on an in-process thread pool. Move it to a real queue (Celery, RQ, or Arq) to run several API replicas.
 - DOCX and XLSX attachments aren't parsed yet. They're skipped at ingestion.
-- Rules-engine heuristics are tuned for Indian GST invoices. Other regions mostly escalate to the LLM tiers.
+- Rules-engine heuristics are tuned for Indian GST invoices. Other regions mostly escalate to Azure.
+- Azure's invoice model doesn't document support for quotations. They're sent with a quotation hint, and local
+  rules fill the quotation-only fields, but check accuracy on your own quotations.
+- Local OCR quality on handwriting is low. Handwritten documents are classified Difficult and go straight to Azure.
 - Thresholds in `complexity.py` and `ADI_ACCEPT_CONFIDENCE` should be calibrated on a labelled set of your real documents.

@@ -115,30 +115,31 @@ class FakeEngine:
         return EngineResult(document=self._doc, engine_confidence=0.9, cost_usd=self._cost)
 
 
-def test_easy_doc_accepted_at_tier1_without_calling_llms(sample_dir):
-    llm = FakeEngine("ocr_llm", 2, _good())
-    out = Orchestrator([RulesEngine(), llm]).run(ctx_for(sample_dir, "invoice_digital.pdf"), Complexity.EASY, DocType.INVOICE)
-    assert out.accepted and out.best.engine == "rules" and out.total_cost == 0 and llm.calls == 0
+def test_easy_doc_accepted_at_tier1_without_calling_azure(sample_dir):
+    azure = FakeEngine("azure_invoice", 4, _good())
+    out = Orchestrator([RulesEngine(), azure]).run(ctx_for(sample_dir, "invoice_digital.pdf"), Complexity.EASY, DocType.INVOICE)
+    assert out.accepted and out.best.engine == "rules" and out.total_cost == 0 and azure.calls == 0
 
 
 def test_escalates_on_validation_failure_then_accepts(sample_dir):
     broken = _good()
     broken.total = 999
-    t2 = FakeEngine("ocr_llm", 2, broken, cost=0.001)
-    t3 = FakeEngine("vision", 3, _good(), cost=0.02)
-    t4 = FakeEngine("fallback", 4, _good(), cost=0.1)
+    t2 = FakeEngine("local_ocr", 2, broken, cost=0)
+    t3 = FakeEngine("azure_read", 3, _good(), cost=0.0015)
+    t4 = FakeEngine("azure_invoice", 4, _good(), cost=0.01)
     out = Orchestrator([t2, t3, t4]).run(ctx_for(sample_dir, "invoice_scanned.pdf"), Complexity.MEDIUM, DocType.INVOICE)
-    assert out.accepted and out.best.engine == "vision"
-    assert [a.engine for a in out.attempts] == ["ocr_llm", "vision"] and t4.calls == 0
-    assert out.total_cost == 0.021
+    assert out.accepted and out.best.engine == "azure_read"
+    assert [a.engine for a in out.attempts] == ["local_ocr", "azure_read"] and t4.calls == 0
+    assert out.total_cost == 0.0015
 
 
-def test_difficult_starts_at_tier3_and_skips_unavailable(sample_dir):
-    t2 = FakeEngine("ocr_llm", 2, _good())
-    t3 = FakeEngine("azure_di", 3, None, available=False)
-    t4 = FakeEngine("fallback", 4, _good())
-    out = Orchestrator([t2, t3, t4]).run(ctx_for(sample_dir, "invoice_scanned.pdf"), Complexity.DIFFICULT, DocType.INVOICE)
-    assert t2.calls == 0 and out.attempts[0].skipped and out.best.engine == "fallback" and out.accepted
+def test_difficult_starts_at_azure_invoice_and_skips_unavailable(sample_dir):
+    t2 = FakeEngine("local_ocr", 2, _good())
+    t3 = FakeEngine("azure_read", 3, _good())
+    t4 = FakeEngine("azure_invoice", 4, None, available=False)
+    t5 = FakeEngine("azure_invoice_highres", 5, _good())
+    out = Orchestrator([t2, t3, t4, t5]).run(ctx_for(sample_dir, "invoice_scanned.pdf"), Complexity.DIFFICULT, DocType.INVOICE)
+    assert t2.calls == t3.calls == 0 and out.attempts[0].skipped and out.best.engine == "azure_invoice_highres" and out.accepted
 
 
 def test_all_fail_keeps_best_attempt_for_review(sample_dir):
@@ -148,3 +149,10 @@ def test_all_fail_keeps_best_attempt_for_review(sample_dir):
     out = Orchestrator([FakeEngine("a", 2, worse), FakeEngine("b", 3, better), FakeEngine("c", 4, raises=RuntimeError("boom"))]).run(
         ctx_for(sample_dir, "invoice_scanned.pdf"), Complexity.MEDIUM, DocType.INVOICE)
     assert not out.accepted and out.best.engine == "b" and out.attempts[-1].error == "RuntimeError: boom"
+
+
+def test_number_key_folds_ocr_confusions():
+    from app.service import number_key
+
+    assert number_key("SIS/2025-26/0142") == number_key("S1S/2025-26/O142") == number_key("sis 2025 26 0142")
+    assert number_key("SIS/2025-26/0142") != number_key("SIS/2025-26/0143")

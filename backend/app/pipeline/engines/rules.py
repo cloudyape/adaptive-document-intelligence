@@ -49,6 +49,14 @@ HEADER_SYNONYMS = {
 }
 
 
+def clean_ocr_text(text: str) -> str:
+    """Undo common OCR artefacts: table-border pipes/underscores and GSTINs split by a space."""
+    text = re.sub(r"\s*[|¦]\s*", " ", text)
+    text = re.sub(r"(?<=\s)_+(?=\s)", " ", text)
+    text = re.sub(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z])\s?([1-9A-Z])\s?(Z)\s?([0-9A-Z])\b", r"\1\2\3\4", text)
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
 class RulesEngine:
     name = "rules"
     tier = 1
@@ -57,7 +65,7 @@ class RulesEngine:
         return True
 
     def extract(self, ctx: DocumentContext, doc_type_hint: DocType | None = None) -> EngineResult:
-        text = ctx.text
+        text = clean_ocr_text(ctx.text)
         lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("--- page")]
         doc = ExtractedDocument(document_type=doc_type_hint or DocType.OTHER)
         warnings: list[str] = []
@@ -261,8 +269,66 @@ class RulesEngine:
             if len(nums) < 3:
                 continue
             qty, price, amount = nums[-3], nums[-2], nums[-1]
-            if qty > 0 and abs(qty * price - amount) <= max(1.0, 0.01 * amount):
+            # Accept the row when qty x price ~= amount; OCR misreads that break the arithmetic are kept
+            # (if the row is otherwise well-formed) so validation flags them and the doc escalates.
+            plausible = qty > 0 and (abs(qty * price - amount) <= max(1.0, 0.01 * amount) or (qty == int(qty) and qty < 10000 and price > 0))
+            if plausible:
                 desc = m.group(1).strip()
+                raw_nums = [x for x in m.group(2).split() if not x.endswith("%")]
                 hsn = re.search(r"\b(\d{4,8})\b", desc)
-                items.append(LineItem(description=desc, quantity=qty, unit_price=price, amount=amount, hsn_sac=hsn.group(1) if hsn else None))
+                hsn_code = hsn.group(1) if hsn else (raw_nums[0] if len(nums) >= 4 and re.fullmatch(r"\d{4,8}", raw_nums[0]) else None)
+                items.append(LineItem(description=desc, quantity=qty, unit_price=price, amount=amount, hsn_sac=hsn_code))
         return items
+
+
+class LocalOcrRulesEngine(RulesEngine):
+    """Tier 2 - rules over locally OCR'd text (Tesseract). Free; used for scans and photos.
+
+    `preprocess.analyze` already OCR'd pages without a text layer. If that reading doesn't validate,
+    this engine re-OCRs with other preprocessing variants (deskew, binarization) and keeps the
+    candidate that validates best, filling its gaps from the others. CPU cost only.
+    """
+
+    name = "local_ocr"
+    tier = 2
+
+    def available(self) -> bool:
+        from app.pipeline.preprocess import _tesseract_available
+
+        return _tesseract_available()
+
+    def extract(self, ctx, doc_type_hint=None):
+        from dataclasses import replace
+
+        from app.pipeline.engines.base import EngineUnavailable
+        from app.pipeline.merge import merge
+        from app.pipeline.preprocess import OCR_VARIANTS, ocr_variant_pages
+        from app.pipeline.validation import validate
+
+        if not ctx.has_usable_text:
+            raise EngineUnavailable("local OCR found no readable text")
+
+        def run(c, label):
+            r = RulesEngine.extract(self, c, doc_type_hint)
+            confs = [p.ocr_confidence for p in c.pages if p.ocr_confidence is not None]
+            if confs:  # weight the rules engine's confidence by how well the page was read
+                r.engine_confidence = round(r.engine_confidence * min(1.0, sum(confs) / len(confs) / 90), 2)
+            r.warnings.append(f"ocr variant: {label}")
+            return r, validate(r.document, r.engine_confidence)
+
+        candidates = [run(ctx, "lines_removed")]
+        has_ocr = any(p.text_source == "ocr" for p in ctx.pages)
+        for variant in list(OCR_VARIANTS)[1:] if has_ocr else []:
+            if any(v.passed for _, v in candidates):
+                break  # stop at the first variant that validates
+            candidates.append(run(replace(ctx, pages=ocr_variant_pages(ctx, variant)), variant))
+
+        candidates.sort(key=lambda c: c[1].score, reverse=True)
+        best, best_v = candidates[0]
+        if not best_v.passed and len(candidates) > 1:
+            merged = merge(best.document, *(c[0].document for c in candidates[1:]))
+            mv = validate(merged, best.engine_confidence)
+            if mv.score > best_v.score:
+                best.document = merged
+                best.warnings.append("merged fields from other OCR variants")
+        return best

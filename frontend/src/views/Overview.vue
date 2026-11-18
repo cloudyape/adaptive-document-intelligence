@@ -30,16 +30,17 @@ async function ingest() {
 }
 
 const tiers = [
-  { key: 'easy', label: 'Easy', route: 'Rules engine', color: 'bg-teal-500' },
-  { key: 'medium', label: 'Medium', route: 'OCR + small LLM', color: 'bg-indigo-500' },
-  { key: 'difficult', label: 'Difficult', route: 'Document AI', color: 'bg-fuchsia-500' },
+  { key: 'easy', label: 'Easy', route: 'Rules on text layer', color: 'bg-teal-500' },
+  { key: 'medium', label: 'Medium', route: 'Local OCR + rules, then Azure Read', color: 'bg-indigo-500' },
+  { key: 'difficult', label: 'Difficult', route: 'Azure invoice model', color: 'bg-fuchsia-500' },
 ]
 const routed = computed(() => tiers.reduce((n, t) => n + (stats.value?.by_complexity[t.key] ?? 0), 0))
 const engineNames: Record<string, string> = {
-  rules: 'Rules engine', ocr: 'Local OCR (Tesseract)', claude: 'Claude API', azure_di: 'Azure Document Intelligence',
+  rules: 'Rules engine', ocr: 'Local OCR (Tesseract)', azure_di: 'Azure Document Intelligence',
 }
 const engineLabels: Record<string, string> = {
-  rules: 'Rules (lightweight)', ocr_llm: 'OCR + LLM', claude_vision: 'Claude vision', azure_di: 'Azure Document Intelligence', claude_fallback: 'Fallback (top model)',
+  rules: 'Rules (text layer)', local_ocr: 'Local OCR + rules', azure_read: 'Azure Read + rules',
+  azure_invoice: 'Azure invoice model', azure_invoice_highres: 'Azure invoice, high-res (fallback)',
 }
 </script>
 
@@ -102,6 +103,10 @@ const engineLabels: Record<string, string> = {
         </ul>
         <div v-if="config" class="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500">
           Accept at ≥ {{ pct(config.accept_confidence) }} validation score · cost cap {{ usd(config.max_cost_per_document_usd) }} / doc
+          <div v-if="config.engines.azure_di" class="mt-1">
+            Azure per page: read {{ usd(config.azure.cost_per_page.read) }} · invoice {{ usd(config.azure.cost_per_page.invoice) }}
+            · high-res +{{ usd(config.azure.cost_per_page.highres_addon) }}
+          </div>
         </div>
       </section>
     </div>

@@ -1,9 +1,10 @@
 """Adaptive extraction orchestration.
 
-    EASY       -> tier 1 rules            (free)
-    MEDIUM     -> tier 2 OCR + small LLM  (fractions of a cent)
-    DIFFICULT  -> tier 3 document AI      (Azure DI if configured, else Claude vision)
-    any failure-> next tier up ... tier 4 fallback (top model, sees prior errors)
+    EASY       -> tier 1 rules on the text layer               (free)
+    MEDIUM     -> tier 2 local Tesseract OCR + rules            (free)
+                  tier 3 Azure DI prebuilt-read OCR + rules     (cheapest Azure call)
+    DIFFICULT  -> tier 4 Azure DI prebuilt-invoice              (fields + line items)
+    any failure-> next tier up ... tier 5 prebuilt-invoice + high-resolution OCR, merged with earlier attempts
     still failing -> best attempt goes to human review
 
 Pure logic, no database: returns every attempt so the caller can persist the audit trail.
@@ -15,17 +16,16 @@ import time
 from dataclasses import dataclass, field
 
 from app.config import get_settings
-from app.pipeline.engines.azure_di import AzureDocumentIntelligenceEngine
+from app.pipeline.engines.azure_di import AzureHighResFallback, AzureInvoiceEngine, AzureReadRulesEngine
 from app.pipeline.engines.base import Engine, EngineResult, EngineUnavailable
-from app.pipeline.engines.claude import FallbackEngine, OcrLlmEngine, VisionEngine
-from app.pipeline.engines.rules import RulesEngine
+from app.pipeline.engines.rules import LocalOcrRulesEngine, RulesEngine
 from app.pipeline.preprocess import DocumentContext
 from app.pipeline.validation import ValidationReport, validate
 from app.schemas import Complexity, DocType
 
 log = logging.getLogger(__name__)
 
-START_TIER = {Complexity.EASY: 1, Complexity.MEDIUM: 2, Complexity.DIFFICULT: 3}
+START_TIER = {Complexity.EASY: 1, Complexity.MEDIUM: 2, Complexity.DIFFICULT: 4}
 
 
 @dataclass
@@ -59,9 +59,7 @@ class Outcome:
 
 
 def default_ladder() -> list[Engine]:
-    azure = AzureDocumentIntelligenceEngine()
-    tier3: Engine = azure if azure.available() else VisionEngine()
-    return [RulesEngine(), OcrLlmEngine(), tier3, FallbackEngine()]
+    return [RulesEngine(), LocalOcrRulesEngine(), AzureReadRulesEngine(), AzureInvoiceEngine(), AzureHighResFallback()]
 
 
 class Orchestrator:
@@ -83,9 +81,9 @@ class Orchestrator:
             if not engine.available():
                 outcome.attempts.append(Attempt(engine.name, engine.tier, 0, error="engine not configured", skipped=True))
                 continue
-            if isinstance(engine, FallbackEngine) and outcome.best and outcome.best.result:
-                engine.previous_result = outcome.best.result.document.model_dump(mode="json")
-                engine.previous_issues = outcome.best.validation.messages() if outcome.best.validation else []
+            if hasattr(engine, "previous_results"):  # fallback merges what earlier tiers found, best first
+                ranked = sorted((a for a in outcome.attempts if a.result), key=lambda a: a.score, reverse=True)
+                engine.previous_results = [a.result.document for a in ranked]
 
             t0 = time.monotonic()
             attempt = Attempt(engine.name, engine.tier, 0)

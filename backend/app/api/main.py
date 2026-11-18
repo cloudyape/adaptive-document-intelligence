@@ -17,8 +17,6 @@ from app.config import get_settings
 from app.db import get_session, init_db
 from app.ingestion.graph import GraphNotConfigured
 from app.models import Document, ExtractionAttempt, FinancialRecord
-from app.pipeline import llm
-from app.pipeline.engines.azure_di import AzureDocumentIntelligenceEngine
 from app.pipeline.preprocess import _tesseract_available
 from app.schemas import DocStatus, ExtractedDocument
 from app.service import guess_mime, review, store_document
@@ -34,7 +32,7 @@ async def lifespan(_app: FastAPI):
     worker.stop()
 
 
-app = FastAPI(title="Adaptive Document Intelligence", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Dealer Quote Parsing", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -94,11 +92,13 @@ def config() -> dict:
         "engines": {
             "rules": True,
             "ocr": _tesseract_available(),
-            "claude": s.llm_enabled and llm.available(),
-            "azure_di": AzureDocumentIntelligenceEngine().available(),
+            "azure_di": bool(s.azure_di_endpoint and s.azure_di_key),
         },
-        "models": {"classifier": s.model_classifier, "ocr_llm": s.model_ocr_llm,
-                   "document_ai": s.model_document_ai, "fallback": s.model_fallback},
+        "azure": {
+            "read_enabled": s.azure_di_read_enabled, "highres_fallback": s.azure_di_highres_fallback,
+            "cost_per_page": {"read": s.azure_di_read_cost_per_page, "invoice": s.azure_di_invoice_cost_per_page,
+                              "highres_addon": s.azure_di_highres_cost_per_page},
+        },
         "graph_configured": bool(s.graph_tenant_id and s.graph_client_id and s.graph_client_secret and s.graph_mailbox),
         "graph_poll_enabled": s.graph_poll_enabled,
         "accept_confidence": s.accept_confidence,
