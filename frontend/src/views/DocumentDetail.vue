@@ -19,6 +19,7 @@ let timer: number | undefined
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v))
 
 const emptyDoc = (): Extracted => ({
+  margin_amount: null, margin_percent: null,
   document_type: 'invoice', document_number: null, document_date: null, due_date: null, valid_until: null, po_number: null,
   currency: 'INR', vendor: { name: null, gstin: null }, buyer: { name: null, gstin: null }, line_items: [], subtotal: null,
   discount_total: null, cgst: null, sgst: null, igst: null, cess: null, tax_total: null, shipping: null, round_off: null,
@@ -54,15 +55,24 @@ function num(v: unknown): number | null {
 }
 function normalized(): Extracted {
   const f = clone(form.value!)
-  for (const k of ['subtotal', 'discount_total', 'cgst', 'sgst', 'igst', 'cess', 'tax_total', 'shipping', 'round_off', 'total'] as const)
+  for (const k of ['subtotal', 'discount_total', 'cgst', 'sgst', 'igst', 'cess', 'tax_total', 'shipping', 'round_off', 'total',
+    'margin_amount', 'margin_percent', 'other_charges', 'trade_in'] as const)
     f[k] = num(f[k])
-  f.line_items = f.line_items.map((li) => ({ ...li, quantity: num(li.quantity), unit_price: num(li.unit_price), discount: num(li.discount), tax_rate: num(li.tax_rate), amount: num(li.amount) }))
-  for (const k of ['document_number', 'document_date', 'due_date', 'valid_until', 'po_number', 'payment_terms'] as const)
+  f.line_items = f.line_items.map((li) => ({
+    ...li, quantity: num(li.quantity), unit_price: num(li.unit_price), discount: num(li.discount), tax_rate: num(li.tax_rate),
+    amount: num(li.amount), base_price: num(li.base_price), msrp: num(li.msrp), margin_amount: num(li.margin_amount), margin_percent: num(li.margin_percent),
+    series: li.series || null, model: li.model || null,
+    options: (li.options ?? []).filter((o) => o.name?.trim()).map((o) => ({ name: o.name.trim(), price: num(o.price) })),
+  }))
+  for (const k of ['document_number', 'document_date', 'due_date', 'valid_until', 'po_number', 'payment_terms', 'notes'] as const)
     if (f[k] === '') f[k] = null
   return f
 }
 function addLine() {
-  form.value!.line_items.push({ description: '', hsn_sac: null, quantity: null, unit: null, unit_price: null, discount: null, tax_rate: null, amount: null } as LineItem)
+  form.value!.line_items.push({
+    description: '', hsn_sac: null, quantity: null, unit: null, unit_price: null, discount: null, tax_rate: null, amount: null,
+    series: null, model: null, options: [], base_price: null, margin_amount: null, margin_percent: null,
+  })
 }
 
 async function act(action: 'approve' | 'reject' | 'correct') {
@@ -96,7 +106,15 @@ const headerFields: [keyof Extracted, string, string?][] = [
 ]
 const totalFields: [keyof Extracted, string][] = [
   ['subtotal', 'Subtotal'], ['discount_total', 'Discount'], ['cgst', 'CGST'], ['sgst', 'SGST'], ['igst', 'IGST'],
-  ['cess', 'Cess'], ['tax_total', 'Tax total'], ['shipping', 'Shipping'], ['round_off', 'Round off'], ['total', 'Grand total'],
+  ['cess', 'Cess'], ['tax_total', 'Tax total'], ['shipping', 'Shipping'], ['other_charges', 'Fees'], ['trade_in', 'Trade-in'],
+  ['round_off', 'Round off'], ['total', 'Grand total'],
+  ['margin_amount', 'Margin By'], ['margin_percent', 'Margin By %'],
+]
+// Line-item fields, in display order: [key, label, numeric?, wide?]
+const lineFields: [keyof LineItem, string, boolean, boolean?][] = [
+  ['description', 'Description', false, true], ['series', 'Series', false], ['model', 'Model', false],
+  ['hsn_sac', 'HSN', false], ['quantity', 'Qty', true], ['base_price', 'Base price', true], ['msrp', 'MSRP', true], ['unit_price', 'Unit price', true],
+  ['tax_rate', 'Tax %', true], ['amount', 'Amount', true], ['margin_amount', 'Margin By', true], ['margin_percent', 'Margin By %', true],
 ]
 </script>
 
@@ -171,25 +189,29 @@ const totalFields: [keyof Extracted, string][] = [
             </div>
           </div>
 
-          <div class="card overflow-x-auto">
-            <table class="min-w-full text-sm">
-              <thead><tr>
-                <th class="th">Description</th><th class="th">HSN</th><th class="th text-right">Qty</th>
-                <th class="th text-right">Unit price</th><th class="th text-right">Tax %</th><th class="th text-right">Amount</th><th></th>
-              </tr></thead>
-              <tbody>
-                <tr v-for="(li, i) in form.line_items" :key="i" class="border-t border-slate-100">
-                  <td class="p-1 min-w-48"><input v-model="li.description" class="input" /></td>
-                  <td class="p-1 w-20"><input v-model="li.hsn_sac" class="input" /></td>
-                  <td class="p-1 w-20"><input v-model="li.quantity" class="input text-right" /></td>
-                  <td class="p-1 w-28"><input v-model="li.unit_price" class="input text-right" /></td>
-                  <td class="p-1 w-16"><input v-model="li.tax_rate" class="input text-right" /></td>
-                  <td class="p-1 w-28"><input v-model="li.amount" class="input text-right" :class="fieldClass(`line_items[${i}].amount`)" /></td>
-                  <td class="p-1"><button class="text-slate-400 hover:text-rose-600" title="Remove line" @click="form.line_items.splice(i, 1)">✕</button></td>
-                </tr>
-              </tbody>
-            </table>
-            <div class="flex items-center justify-between border-t border-slate-100 px-3 py-2 text-xs text-slate-500">
+          <div class="space-y-3">
+            <div v-for="(li, i) in form.line_items" :key="i" class="card p-3">
+              <div class="mb-2 flex items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <span>Line {{ i + 1 }}</span>
+                <button class="font-normal normal-case text-slate-400 hover:text-rose-600" @click="form.line_items.splice(i, 1)">Remove</button>
+              </div>
+              <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <div v-for="[k, label, numeric, wide] in lineFields" :key="k" :class="wide ? 'col-span-2' : ''">
+                  <label class="label">{{ label }}</label>
+                  <input v-model="(li[k] as string)" class="input" :class="[numeric ? 'text-right tabular-nums' : '', fieldClass(`line_items[${i}].${k}`)]" />
+                </div>
+              </div>
+              <div class="mt-3">
+                <div class="label mb-1">Options</div>
+                <div v-for="(o, j) in li.options" :key="j" class="mb-1 flex gap-2">
+                  <input v-model="o.name" class="input flex-1" placeholder="Option" />
+                  <input v-model="(o.price as unknown as string)" class="input w-32 text-right tabular-nums" placeholder="Price" />
+                  <button class="px-1 text-slate-400 hover:text-rose-600" title="Remove option" @click="li.options.splice(j, 1)">✕</button>
+                </div>
+                <button class="text-xs text-indigo-600 hover:underline" @click="(li.options ??= []).push({ name: '', price: null })">+ Add option</button>
+              </div>
+            </div>
+            <div class="flex items-center justify-between px-1 text-xs text-slate-500">
               <button class="text-indigo-600 hover:underline" @click="addLine">+ Add line</button>
               <span>Lines sum to <span class="tabular-nums font-medium text-slate-700">{{ money(lineSum, form.currency) }}</span></span>
             </div>
@@ -202,9 +224,14 @@ const totalFields: [keyof Extracted, string][] = [
                 <input v-model="(form[k] as number)" class="input text-right tabular-nums" :class="[fieldClass(k), k === 'total' ? 'font-semibold' : '']" />
               </div>
             </div>
+            <div v-if="form.margin_source" class="mt-2 text-xs text-slate-500">Margin calculated from {{ form.margin_source }}. Clear both margin fields and save to recalculate.</div>
             <div class="mt-3">
               <label class="label">Payment terms</label>
               <input v-model="form.payment_terms" class="input" />
+            </div>
+            <div class="mt-3">
+              <label class="label">Comment / Notes</label>
+              <textarea v-model="form.notes" rows="3" class="input" />
             </div>
           </div>
 

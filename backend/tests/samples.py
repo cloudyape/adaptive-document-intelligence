@@ -104,6 +104,65 @@ def quotation_pdf() -> bytes:
     return buf.getvalue()
 
 
+def dealer_quote_pdf(with_margin: bool = True) -> bytes:
+    """Single-unit dealer quotation laid out as labels (no line-item table), with options and margin."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+    y = h - 20 * mm
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(20 * mm, y, "Green Valley Tractors")
+    c.setFont("Helvetica-Bold", 13)
+    c.drawRightString(w - 20 * mm, y, "QUOTATION")
+    c.setFont("Helvetica", 9)
+    rows = [
+        ("Authorised Dealer, NH-48, Nashik 422010", "Quotation No: GVT-Q-0915"),
+        (f"GSTIN: {VENDOR_GSTIN}", "Date: 10/11/2026"),
+        ("", "Valid Until: 10/12/2026"),
+    ]
+    for left, right in rows:
+        y -= 13
+        c.drawString(20 * mm, y, left)
+        c.drawRightString(w - 20 * mm, y, right)
+    y -= 22
+    c.drawString(20 * mm, y, "To: Tutorlabs Learning Solutions LLP")
+    y -= 24
+    for label, val in [("Series:", "5E Series"), ("Model:", "5050E 4WD"), ("Base Price:", "8,50,000.00")]:
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(20 * mm, y, label)
+        c.setFont("Helvetica", 10)
+        c.drawString(55 * mm, y, val)
+        y -= 15
+    y -= 6
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(20 * mm, y, "Optional Equipment:")
+    c.setFont("Helvetica", 10)
+    for name, price in [("Front End Loader", "1,20,000.00"), ("Rotavator 7 ft", "65,000.00")]:
+        y -= 14
+        c.drawString(25 * mm, y, f"- {name}")
+        c.drawRightString(w - 20 * mm, y, price)
+    y -= 24
+    for label, val in [("Sub Total", "10,35,000.00"), ("CGST @ 6%", "62,100.00"), ("SGST @ 6%", "62,100.00"),
+                       ("Total Amount Payable", "11,59,200.00")]:
+        c.drawString(110 * mm, y, label)
+        c.drawRightString(w - 20 * mm, y, val)
+        y -= 14
+    y -= 10
+    if with_margin:
+        c.drawString(20 * mm, y, "Dealer Margin: 51,750.00")
+        y -= 14
+        c.drawString(20 * mm, y, "Margin %: 5.00")
+    y -= 20
+    c.drawString(20 * mm, y, "Payment Terms: 25% advance, balance before delivery")
+    y -= 14
+    c.drawString(20 * mm, y, "Remarks: Delivery within 3 weeks of order. Price includes registration")
+    y -= 12
+    c.drawString(20 * mm, y, "and first two free services.")
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
 def scanned_invoice_pdf() -> bytes:
     """Rasterize the digital invoice and wrap it in an image-only PDF (what a scanner produces)."""
     import pypdfium2 as pdfium
@@ -151,4 +210,5 @@ if __name__ == "__main__":
     (out / "invoice_scanned.pdf").write_bytes(scanned_invoice_pdf())
     (out / "letter.pdf").write_bytes(letter_pdf())
     (out / "invoice_email.html").write_text(INVOICE_EMAIL_HTML)
+    (out / "dealer_quote.pdf").write_bytes(dealer_quote_pdf())
     print(f"wrote samples to {out}")

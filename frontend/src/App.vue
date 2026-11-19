@@ -7,6 +7,7 @@ const nav = [
   { to: '/documents', label: 'Documents' },
   { to: '/review', label: 'Review queue' },
   { to: '/records', label: 'Financial records' },
+  { to: '/price-files', label: 'Price files' },
 ]
 const reviewCount = ref(0)
 const refreshCount = () => api.reviewQueue().then((r) => (reviewCount.value = r.total)).catch(() => {})

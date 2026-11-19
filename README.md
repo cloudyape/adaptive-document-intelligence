@@ -46,6 +46,58 @@ Outlook ──Graph──▶ identify ──▶ classify complexity ──▶ ro
 - **Dedupe.** Files are deduplicated by SHA-256. A document with the same vendor and number as an earlier one
   is flagged as a possible duplicate.
 
+## Extracted fields
+
+Every document is stored in one standard shape (`backend/app/schemas.py`):
+
+- **Quote / invoice header:** type, number, date, due date, valid until, PO number, currency, vendor and buyer
+  (name, address, GSTIN, PAN), payment terms, **Comment / Notes**
+- **Per line item (one per quoted machine):** description, **Series**, **Model**, HSN/SAC, quantity, **Base Price**
+  (the machine alone), MSRP when printed, **Options** (the machine's listed features, plus separately priced
+  attachments with their prices), unit price, tax rate, amount, **Margin By**, **Margin By %**
+- **Totals:** subtotal, discount and incentives, sales tax (or CGST/SGST/IGST for Indian documents), fees (doc, title,
+  UCC, processing…), trade-in allowance, grand total, **Margin By**, **Margin By %**, and where the margin came from
+
+**How margin is defined.** *Margin By* = selling price − dealer cost. *Margin By %* = that margin ÷ selling price
+(margin on sale, not markup on cost). Dealer quotes don't print a margin, so it is calculated from the **dealer cost
+price file** uploaded on the *Price files* page (CSV or Excel with "Model / Part #" and "Dealer Cost / Dealer Net"
+columns, optional "MSRP"; PDF best-effort; template: [docs/price-file-template.csv](docs/price-file-template.csv)). The newest active file is used, matched by model or part number while
+ignoring case and separators. Priced options are included when all of them have a cost; otherwise the margin covers
+the machine alone. Uploading a new file recalculates unverified records. A margin printed on the document is never
+overwritten, and approved records are left alone. A reviewer can clear both margin fields to recalculate.
+
+The selling price is the unit's pre-tax price (base price + priced options, × quantity); for the whole quote, it is the
+sum of those line prices (or the subtotal). When a document does print one of the two margin values, the other is
+calculated from it. The same applies when a reviewer types one of them. Validation also accepts a percentage of the base price
+alone, and flags margins outside 0–100%, a margin larger than the quote total, and base price + options that don't add
+up to the unit price.
+
+**Where the values come from.** Labelled values (`Series:`, `Model:`, `Base Price:`, `Dealer Margin:`, `Margin %:`),
+an `Options` / `Optional Equipment` / `Accessories` list, `Remarks` / `Notes` / `Comments` sections, or table columns
+with those headings. A single-unit quote written as labels rather than a table gets its line item built from the labels.
+
+**Series** is Kubota's series name: the one printed on the document ("S Series SVL75-3HFWVRCC"), else mapped from
+the model prefix (SVL/SSV → S Series, KX → K Series, U → U Series, B/BX/L/LX/MX tractors). Models without a
+reliable mapping (SCL, R, RTV, M62) are left blank for a reviewer.
+
+### US dealer quotes
+
+US dealer quotes (Kubota quote tool, sales agreements, wholegood sales orders, Word/Excel quote forms) are read by
+patterns rather than per-dealer templates (`backend/app/pipeline/engines/us_quote.py`):
+
+- **Money lines:** a description plus `$` amounts, with the quantity just before the first amount.
+- **Machines:** recognised by Kubota model number. The unpriced lines below a machine are its options, and priced
+  attachments (buckets, forks, mulchers) become priced options of that machine.
+- **Charges:** fees, trade-ins, incentives and discounts are separated from equipment.
+- **Totals:** US labels (Invoice Total, Total Selling Price, Finance Subtotal, Sales Tax…), reconciled as
+  subtotal + tax + fees − trade-in − incentives.
+- **Dates:** month-first.
+- **Dealer name:** taken from the header, matched against the dealer's website. Names that only appear in a logo are
+  left empty, so the document escalates to Azure (which reads logos) or review rather than taking the customer's
+  name.
+- **Fillable PDF forms and Excel quotes:** values are read from form fields and from visible, currency-formatted
+  cells.
+
 ## Run it
 
 **With Docker** (PostgreSQL + API + dashboard at http://localhost:8080):
@@ -122,9 +174,11 @@ frontend/src/     Vue 3 + Tailwind v4: Overview, Documents, Document detail/revi
 
 ## Known limits / next steps
 
-- Tables are created with `create_all` on startup. Add Alembic before the first production schema change.
+- Tables are created with `create_all` on startup, and new nullable columns are added to existing databases
+  automatically (`add_missing_columns` in `db.py`). Anything beyond adding columns (renames, type changes) needs
+  Alembic, which should be adopted before production.
 - Processing runs on an in-process thread pool. Move it to a real queue (Celery, RQ, or Arq) to run several API replicas.
-- DOCX and XLSX attachments aren't parsed yet. They're skipped at ingestion.
+- Word (.docx) attachments aren't parsed yet. They're skipped at ingestion. Excel (.xlsx / .xlsm) quotes are supported.
 - Rules-engine heuristics are tuned for Indian GST invoices. Other regions mostly escalate to Azure.
 - Azure's invoice model doesn't document support for quotations. They're sent with a quotation hint, and local
   rules fill the quotation-only fields, but check accuracy on your own quotations.

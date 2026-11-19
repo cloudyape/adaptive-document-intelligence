@@ -122,6 +122,10 @@ class FinancialRecord(Base):
     tax_total: Mapped[float | None] = mapped_column(Float)
     total: Mapped[float | None] = mapped_column(Float)
     payment_terms: Mapped[str | None] = mapped_column(Text)
+    margin_amount: Mapped[float | None] = mapped_column(Float)
+    margin_percent: Mapped[float | None] = mapped_column(Float)
+    trade_in: Mapped[float | None] = mapped_column(Float)
+    notes: Mapped[str | None] = mapped_column(Text)
     data: Mapped[dict] = mapped_column(JSONType)  # full ExtractedDocument
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
     verified_by: Mapped[str | None] = mapped_column(String(320))
@@ -141,6 +145,13 @@ class LineItemRow(Base):
     record_id: Mapped[int] = mapped_column(ForeignKey("financial_records.id", ondelete="CASCADE"), index=True)
     position: Mapped[int] = mapped_column(Integer)
     description: Mapped[str | None] = mapped_column(Text)
+    series: Mapped[str | None] = mapped_column(String(128))
+    model: Mapped[str | None] = mapped_column(String(256), index=True)
+    options: Mapped[list | None] = mapped_column(JSONType)
+    base_price: Mapped[float | None] = mapped_column(Float)
+    msrp: Mapped[float | None] = mapped_column(Float)
+    margin_amount: Mapped[float | None] = mapped_column(Float)
+    margin_percent: Mapped[float | None] = mapped_column(Float)
     hsn_sac: Mapped[str | None] = mapped_column(String(16))
     quantity: Mapped[float | None] = mapped_column(Float)
     unit: Mapped[str | None] = mapped_column(String(32))
@@ -173,3 +184,33 @@ class KeyValue(Base):
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
+
+
+class PriceFile(Base):
+    """An uploaded dealer cost price list. The newest active file is used for margins."""
+
+    __tablename__ = "price_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    filename: Mapped[str] = mapped_column(String(512))
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    uploaded_by: Mapped[str | None] = mapped_column(String(320))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    warnings: Mapped[list | None] = mapped_column(JSONType)
+
+    entries: Mapped[list[PriceEntry]] = relationship(back_populates="price_file", cascade="all, delete-orphan")
+
+
+class PriceEntry(Base):
+    __tablename__ = "price_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    price_file_id: Mapped[int] = mapped_column(ForeignKey("price_files.id", ondelete="CASCADE"), index=True)
+    model_key: Mapped[str] = mapped_column(String(64), index=True)  # normalised model / part number
+    model_number: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str | None] = mapped_column(Text)
+    dealer_cost: Mapped[float | None] = mapped_column(Float)
+    msrp: Mapped[float | None] = mapped_column(Float)
+
+    price_file: Mapped[PriceFile] = relationship(back_populates="entries")

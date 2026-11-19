@@ -44,8 +44,22 @@ class Party(BaseModel):
     phone: str | None = None
 
 
+class OptionItem(BaseModel):
+    """An add-on / optional equipment on a quoted unit."""
+
+    name: str
+    price: float | None = Field(None, description="Option price, if printed")
+
+
 class LineItem(BaseModel):
     description: str | None = None
+    series: str | None = Field(None, description="Product line / family, e.g. '5E Series'")
+    model: str | None = Field(None, description="Specific model or variant, e.g. '5050E 4WD'")
+    options: list[OptionItem] = Field(default_factory=list, description="Add-ons chosen on top of the base model")
+    base_price: float | None = Field(None, description="Price of the model alone, before options, discounts and tax")
+    msrp: float | None = Field(None, description="Manufacturer's suggested retail / list price, if printed")
+    margin_amount: float | None = Field(None, description="Margin By: dealer margin as an amount")
+    margin_percent: float | None = Field(None, description="Margin By %: dealer margin as a percentage")
     hsn_sac: str | None = Field(None, description="HSN or SAC code")
     quantity: float | None = None
     unit: str | None = None
@@ -74,7 +88,12 @@ class ExtractedDocument(BaseModel):
     cess: float | None = None
     tax_total: float | None = Field(None, description="Total tax amount")
     shipping: float | None = None
+    other_charges: float | None = Field(None, description="Doc, title, UCC, processing, setup and similar fees")
+    trade_in: float | None = Field(None, description="Trade-in allowance credited against the sale (positive number)")
     round_off: float | None = None
     total: float | None = Field(None, description="Grand total payable")
     payment_terms: str | None = None
-    notes: str | None = None
+    margin_amount: float | None = Field(None, description="Margin By: total dealer margin on the quote")
+    margin_percent: float | None = Field(None, description="Margin By %: total margin as a percentage")
+    notes: str | None = Field(None, description="Comment / Notes: remarks, conditions, special terms")
+    margin_source: str | None = Field(None, description="Where the margin came from, e.g. the price file used")

@@ -19,7 +19,8 @@ from app.ingestion.graph import GraphNotConfigured
 from app.models import Document, ExtractionAttempt, FinancialRecord
 from app.pipeline.preprocess import _tesseract_available
 from app.schemas import DocStatus, ExtractedDocument
-from app.service import guess_mime, review, store_document
+from app.models import PriceEntry, PriceFile
+from app.service import guess_mime, import_price_file, recompute_margins, review, store_document
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -245,3 +246,50 @@ def ingest_now() -> dict:
         return worker.run_ingestion_once()
     except GraphNotConfigured as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+# ---------- dealer cost price files ----------
+def _pf(pf: PriceFile) -> dict:
+    return {"id": pf.id, "filename": pf.filename, "uploaded_at": pf.uploaded_at, "uploaded_by": pf.uploaded_by,
+            "active": pf.active, "row_count": pf.row_count, "warnings": pf.warnings or []}
+
+
+@app.get("/api/price-files")
+def list_price_files(session: Session = Depends(get_session)) -> dict:
+    files = session.scalars(select(PriceFile).order_by(PriceFile.uploaded_at.desc(), PriceFile.id.desc())).all()
+    return {"items": [_pf(f) for f in files]}
+
+
+@app.post("/api/price-files")
+async def upload_price_file(file: UploadFile = File(...), uploaded_by: str | None = None,
+                            session: Session = Depends(get_session)) -> dict:
+    try:
+        pf = import_price_file(session, await file.read(), file.filename or "prices", uploaded_by)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _pf(pf) | {"records_recalculated": recompute_margins(session)}
+
+
+@app.get("/api/price-files/{pf_id}/entries")
+def price_entries(pf_id: int, q: str | None = None, limit: int = Query(200, le=2000),
+                  session: Session = Depends(get_session)) -> dict:
+    stmt = select(PriceEntry).where(PriceEntry.price_file_id == pf_id)
+    if q:
+        stmt = stmt.where(or_(PriceEntry.model_number.ilike(f"%{q}%"), PriceEntry.description.ilike(f"%{q}%")))
+    rows = session.scalars(stmt.order_by(PriceEntry.model_number).limit(limit)).all()
+    return {"items": [{"model_number": e.model_number, "description": e.description, "dealer_cost": e.dealer_cost,
+                       "msrp": e.msrp} for e in rows]}
+
+
+class PriceFilePatch(BaseModel):
+    active: bool
+
+
+@app.patch("/api/price-files/{pf_id}")
+def set_price_file_active(pf_id: int, body: PriceFilePatch, session: Session = Depends(get_session)) -> dict:
+    pf = session.get(PriceFile, pf_id)
+    if pf is None:
+        raise HTTPException(404, "price file not found")
+    pf.active = body.active
+    session.commit()
+    return _pf(pf) | {"records_recalculated": recompute_margins(session)}

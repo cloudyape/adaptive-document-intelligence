@@ -156,3 +156,22 @@ def test_number_key_folds_ocr_confusions():
 
     assert number_key("SIS/2025-26/0142") == number_key("S1S/2025-26/O142") == number_key("sis 2025 26 0142")
     assert number_key("SIS/2025-26/0142") != number_key("SIS/2025-26/0143")
+
+
+def test_reused_quote_number_with_different_total_and_date_is_not_a_duplicate():
+    from app.db import session_scope
+    from app.models import Document, FinancialRecord
+    from app.service import find_duplicate
+
+    with session_scope() as s:
+        docs = []
+        for i, (total, date) in enumerate([(38289.22, "2026-03-13"), (93090.0, "2026-02-16"), (38289.22, "2026-03-20")]):
+            d = Document(filename=f"p{i}.pdf", mime_type="application/pdf", sha256=f"reuse{i}" + "0" * 58, storage_path="x")
+            d.record = FinancialRecord(doc_type="quotation", document_number="53342402", vendor_name="Parish Tractor",
+                                       total=total, document_date=date, data={})
+            s.add(d)
+            s.flush()
+            docs.append(d)
+        assert find_duplicate(s, docs[1]) is None  # same number, different quote
+        assert find_duplicate(s, docs[2]) == docs[0].id  # same number and total: the same quote re-sent
+        s.rollback()

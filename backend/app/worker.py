@@ -55,9 +55,14 @@ def _poll_loop() -> None:
 
 
 def start_poller() -> None:
-    if get_settings().graph_poll_enabled:
-        threading.Thread(target=_poll_loop, name="adi-graph-poller", daemon=True).start()
-        log.info("Outlook poller started")
+    s = get_settings()
+    if not s.graph_poll_enabled:
+        return
+    if not all([s.graph_tenant_id, s.graph_client_id, s.graph_client_secret, s.graph_mailbox]):
+        log.warning("ADI_GRAPH_POLL_ENABLED is true but Outlook isn't configured (ADI_GRAPH_* missing); poller not started")
+        return
+    threading.Thread(target=_poll_loop, name="adi-graph-poller", daemon=True).start()
+    log.info("Outlook poller started")
 
 
 def stop() -> None:

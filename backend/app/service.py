@@ -11,8 +11,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import Document, Email, ExtractionAttempt, FinancialRecord, LineItemRow, ReviewAction
+from app.models import (Document, Email, ExtractionAttempt, FinancialRecord, LineItemRow, PriceEntry, PriceFile,
+                        ReviewAction)
+from app.pricing import CostLookup, model_key, parse_price_file
 from app.pipeline import complexity as complexity_mod
+from app.pipeline.derive import apply_dealer_costs, derive
 from app.pipeline.identify import identify
 from app.pipeline.orchestrator import Orchestrator
 from app.pipeline.preprocess import analyze
@@ -22,13 +25,16 @@ from app.schemas import FINANCIAL_TYPES, DocStatus, DocType, ExtractedDocument
 log = logging.getLogger(__name__)
 
 SUPPORTED_MIMES = {"application/pdf", "image/png", "image/jpeg", "image/jpg", "image/tiff", "image/webp", "image/bmp",
-                   "image/gif", "text/plain", "text/html"}
+                   "image/gif", "text/plain", "text/html",
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.ms-excel.sheet.macroenabled.12"}
 
 
 def guess_mime(filename: str, declared: str | None = None) -> str:
+    if filename.lower().endswith(".xlsm"):
+        return "application/vnd.ms-excel.sheet.macroenabled.12"
     if declared and declared != "application/octet-stream":
         return declared.split(";")[0].strip().lower()
-    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return (mimetypes.guess_type(filename)[0] or "application/octet-stream").lower()
 
 
 def store_document(
@@ -99,6 +105,7 @@ def process_document(session: Session, doc_id: int, orchestrator: Orchestrator |
 
         if outcome.best and outcome.best.result:
             best = outcome.best
+            apply_dealer_costs(best.result.document, cost_lookup(session))
             doc.final_engine, doc.confidence = best.engine, best.score
             _upsert_record(session, doc, best.result.document)
             doc.status = DocStatus.EXTRACTED if outcome.accepted else DocStatus.NEEDS_REVIEW
@@ -135,7 +142,8 @@ def find_duplicate(session: Session, doc: Document) -> int | None:
     if rec is None or not rec.document_number:
         return None
     session.flush()
-    stmt = select(FinancialRecord.document_id, FinancialRecord.document_number).join(Document).where(
+    stmt = select(FinancialRecord.document_id, FinancialRecord.document_number, FinancialRecord.total,
+                  FinancialRecord.document_date).join(Document).where(
         FinancialRecord.document_id != doc.id,
         FinancialRecord.doc_type == rec.doc_type,
         FinancialRecord.document_number.is_not(None),
@@ -148,8 +156,13 @@ def find_duplicate(session: Session, doc: Document) -> int | None:
     else:
         return None
     key = number_key(rec.document_number)
-    for other_id, other_number in session.execute(stmt.order_by(FinancialRecord.document_id)):
-        if number_key(other_number) == key:
+    for other_id, other_number, other_total, other_date in session.execute(stmt.order_by(FinancialRecord.document_id)):
+        if number_key(other_number) != key:
+            continue
+        # Some dealer tools reuse one number across different quotes: a real duplicate also matches total or date
+        same_total = rec.total is not None and other_total is not None and abs(rec.total - other_total) <= 1
+        same_date = rec.document_date is not None and rec.document_date == other_date
+        if same_total or same_date or (rec.total is None and rec.document_date is None):
             return other_id
     return None
 
@@ -158,14 +171,15 @@ def _upsert_record(session: Session, doc: Document, data: ExtractedDocument, *, 
     rec = doc.record or FinancialRecord(document=doc)
     rec.doc_type = data.document_type.value if data.document_type != DocType.OTHER else (doc.doc_type or "other")
     for f in ("document_number", "document_date", "due_date", "valid_until", "po_number", "subtotal",
-              "discount_total", "cgst", "sgst", "igst", "tax_total", "total", "payment_terms"):
+              "discount_total", "cgst", "sgst", "igst", "tax_total", "total", "payment_terms",
+              "margin_amount", "margin_percent", "trade_in", "notes"):
         setattr(rec, f, getattr(data, f))
     rec.currency = (data.currency or "")[:3] or None
     rec.vendor_name, rec.vendor_gstin = data.vendor.name, (data.vendor.gstin or "")[:15] or None
     rec.buyer_name, rec.buyer_gstin = data.buyer.name, (data.buyer.gstin or "")[:15] or None
     rec.data = data.model_dump(mode="json")
     rec.line_items = [
-        LineItemRow(position=i, **li.model_dump()) for i, li in enumerate(data.line_items)
+        LineItemRow(position=i, **li.model_dump(mode="json")) for i, li in enumerate(data.line_items)
     ]
     if verified_by:
         rec.verified, rec.verified_by, rec.verified_at = True, verified_by, datetime.now(timezone.utc)
@@ -183,6 +197,8 @@ def review(session: Session, doc_id: int, action: str, reviewer: str | None, com
         before = doc.record.data if doc.record else {}
         after = corrected.model_dump(mode="json")
         changes = {k: {"from": before.get(k), "to": v} for k, v in after.items() if before.get(k) != v}
+        derive(corrected)  # reviewer typed one of margin amount / %: fill the other
+        apply_dealer_costs(corrected, cost_lookup(session))  # cleared margins are recalculated from dealer cost
         report = validate(corrected, 1.0)
         doc.confidence = report.score
         _upsert_record(session, doc, corrected, verified_by=reviewer or "reviewer")
@@ -205,3 +221,44 @@ def review(session: Session, doc_id: int, action: str, reviewer: str | None, com
     session.add(ReviewAction(document=doc, action=action, reviewer=reviewer, comment=comment, changes=changes))
     session.commit()
     return doc
+
+
+# ---------- dealer cost price files ----------
+def cost_lookup(session: Session) -> CostLookup:
+    pf = session.scalar(select(PriceFile).where(PriceFile.active.is_(True)).order_by(PriceFile.uploaded_at.desc(), PriceFile.id.desc()))
+    if pf is None:
+        return CostLookup({})
+    rows = session.execute(select(PriceEntry.model_key, PriceEntry.dealer_cost).where(
+        PriceEntry.price_file_id == pf.id, PriceEntry.dealer_cost.is_not(None))).all()
+    return CostLookup(dict(rows), source=f"{pf.filename} (uploaded {pf.uploaded_at:%Y-%m-%d})")
+
+
+def import_price_file(session: Session, data: bytes, filename: str, uploaded_by: str | None = None) -> PriceFile:
+    parsed = parse_price_file(data, filename)
+    if not parsed.entries:
+        raise ValueError("no prices found: " + ("; ".join(parsed.warnings) or "empty file"))
+    pf = PriceFile(filename=filename[:500], uploaded_by=uploaded_by, row_count=len(parsed.entries), warnings=parsed.warnings)
+    pf.entries = [PriceEntry(model_key=model_key(e["model_number"]), model_number=e["model_number"][:128],
+                             description=e.get("description"), dealer_cost=e["dealer_cost"], msrp=e.get("msrp"))
+                  for e in parsed.entries]
+    session.add(pf)
+    session.commit()
+    return pf
+
+
+def recompute_margins(session: Session) -> int:
+    """Re-derive cost-based margins on unverified records (e.g. after a new price file). Returns records changed."""
+    lookup = cost_lookup(session)
+    changed = 0
+    for rec in session.scalars(select(FinancialRecord).where(FinancialRecord.verified.is_(False))):
+        data = ExtractedDocument.model_validate(rec.data)
+        if data.margin_source is None and data.margin_amount is not None:
+            continue  # margin was printed on the quote: leave it
+        for li in data.line_items:  # drop previous cost-based margins
+            li.margin_amount = li.margin_percent = None
+        data.margin_amount = data.margin_percent = data.margin_source = None
+        if apply_dealer_costs(data, lookup) or rec.margin_amount is not None:
+            _upsert_record(session, rec.document, data)
+            changed += 1
+    session.commit()
+    return changed

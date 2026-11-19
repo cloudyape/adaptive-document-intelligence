@@ -6,10 +6,12 @@ subtotal/tax/total reconciliation, and GST consistency.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 
 from app.config import get_settings
+from app.pipeline.derive import line_basis
 from app.pipeline.normalize import GSTIN_RE, gstin_checksum_ok, is_iso_date
 from app.schemas import FINANCIAL_TYPES, DocType, ExtractedDocument
 
@@ -44,6 +46,18 @@ class ValidationReport:
 
 def _close(a: float, b: float, tol: float) -> bool:
     return abs(a - b) <= max(tol, abs(b) * 0.002)
+
+
+def _check_margin(check, where: str, amount: float | None, percent: float | None, bases: list[float], tol: float) -> None:
+    prefix = "" if where == "quote" else f"{where}."
+    if percent is not None:
+        check(0 <= percent < 100, f"{prefix}margin_percent", "margin_range", f"margin {percent}% is outside 0-100%", "error")
+    if amount is not None:
+        check(amount >= 0, f"{prefix}margin_amount", "margin_negative", "margin amount is negative", "error")
+    if amount is not None and percent is not None and bases:
+        ok = any(_close(b * percent / 100, amount, max(tol, 0.01 * amount)) for b in bases)
+        check(ok, f"{prefix}margin_percent", "margin_mismatch",
+              f"margin {amount:.2f} is not {percent}% of the price ({', '.join(f'{b:.2f}' for b in bases)})", "warning")
 
 
 def validate(doc: ExtractedDocument, engine_confidence: float = 0.5) -> ValidationReport:
@@ -83,6 +97,8 @@ def validate(doc: ExtractedDocument, engine_confidence: float = 0.5) -> Validati
         check(vn != (doc.buyer.name or "").strip().lower(), "vendor.name", "same_as_buyer", "vendor name equals buyer name", "critical")
         check(sum(h in vn for h in ("description", "qty", "rate", "amount", "price")) < 2, "vendor.name", "looks_like_header",
               f"vendor name '{doc.vendor.name}' looks like a table header", "critical")
+        check(not re.search(r"(quoted\s+by|^\s*for\s*:|ship\s+to|bill\s+to|remit|^\s*page\b|^\s*www\.|@|prepared\s+by)", vn),
+              "vendor.name", "looks_like_label", f"vendor name '{doc.vendor.name}' looks like a label, not a company", "critical")
     for party in ("vendor", "buyer"):
         g = getattr(doc, party).gstin
         if g:
@@ -114,21 +130,39 @@ def validate(doc: ExtractedDocument, engine_confidence: float = 0.5) -> Validati
         sum(v or 0 for v in (doc.cgst, doc.sgst, doc.igst, doc.cess)) if any(v is not None for v in (doc.cgst, doc.sgst, doc.igst)) else None
     )
     if line_sum is not None and doc.subtotal is not None:
-        ok = _close(line_sum, doc.subtotal, tol) or _close(line_sum - (doc.discount_total or 0), doc.subtotal, tol)
+        fees = doc.other_charges or 0
+        ok = any(_close(c, doc.subtotal, tol) for c in (line_sum, line_sum - (doc.discount_total or 0), line_sum + fees))
         check(ok, "subtotal", "lines_vs_subtotal", f"line items sum to {line_sum:.2f} but subtotal is {doc.subtotal:.2f}", "error")
     if doc.total is not None:
         base = doc.subtotal if doc.subtotal is not None else line_sum
         if base is not None:
             extras = (taxes or 0) + (doc.shipping or 0) + (doc.round_off or 0)
-            candidates = [base + extras, base - (doc.discount_total or 0) + extras]
+            fees, trade, disc = doc.other_charges or 0, doc.trade_in or 0, doc.discount_total or 0
+            # subtotals may or may not already include fees; trade-ins and incentives reduce the amount due
+            candidates = [base + extras + f - t - d for f in {0, fees} for t in {0, trade} for d in {0, disc}]
             # Some invoices round the total to the rupee without printing a round-off line
             ok = any(_close(c, doc.total, tol) for c in candidates)
             check(ok, "total", "total_mismatch",
-                  f"subtotal {base:.2f} + tax {taxes or 0:.2f} + other {(doc.shipping or 0) + (doc.round_off or 0):.2f} "
-                  f"- discount {doc.discount_total or 0:.2f} != total {doc.total:.2f}", "critical")
+                  f"subtotal {base:.2f} + tax {taxes or 0:.2f} + fees {(doc.other_charges or 0) + (doc.shipping or 0):.2f} "
+                  f"- trade-in {doc.trade_in or 0:.2f} - discount {doc.discount_total or 0:.2f} != total {doc.total:.2f}", "critical")
     if doc.tax_total is not None and any(v is not None for v in (doc.cgst, doc.sgst, doc.igst)):
         comp = sum(v or 0 for v in (doc.cgst, doc.sgst, doc.igst, doc.cess))
         check(_close(comp, doc.tax_total, tol), "tax_total", "tax_components", f"CGST+SGST+IGST+cess = {comp:.2f} != tax total {doc.tax_total:.2f}", "error")
+
+    # ---- dealer quote: base price + options, margin ----
+    for i, li in enumerate(doc.line_items):
+        if li.base_price is not None and li.unit_price is not None and li.options and all(o.price is not None for o in li.options):
+            expected = li.base_price + sum(o.price for o in li.options)
+            ok = _close(expected, li.unit_price, tol) or _close(li.base_price, li.unit_price, tol)
+            check(ok, f"line_items[{i}].base_price", "base_plus_options",
+                  f"base price {li.base_price:.2f} + options {expected - li.base_price:.2f} != unit price {li.unit_price:.2f}", "warning")
+        _check_margin(check, f"line_items[{i}]", li.margin_amount, li.margin_percent,
+                      [b for b in (line_basis(li), li.base_price, li.amount) if b], tol)
+    line_bases = [line_basis(li) for li in doc.line_items]
+    quote_bases = [b for b in (sum(line_bases) if line_bases and all(line_bases) else None, doc.subtotal, doc.total) if b]
+    _check_margin(check, "quote", doc.margin_amount, doc.margin_percent, quote_bases, tol)
+    if doc.margin_amount is not None and doc.total is not None:
+        check(doc.margin_amount <= doc.total, "margin_amount", "margin_exceeds_total", "margin is larger than the quote total", "error")
 
     # ---- GST consistency ----
     if doc.cgst is not None or doc.sgst is not None:

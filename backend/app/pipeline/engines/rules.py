@@ -8,22 +8,24 @@ from __future__ import annotations
 
 import re
 
+from app.pipeline.engines import us_quote
 from app.pipeline.engines.base import EngineResult
+from app.pipeline.kubota import enrich_models, normalize as normalize_dashes
 from app.pipeline.normalize import DATE_TOKEN, GSTIN_RE, amounts_in, parse_amount, parse_date
 from app.pipeline.preprocess import DocumentContext
-from app.schemas import DocType, ExtractedDocument, LineItem, Party
+from app.schemas import DocType, ExtractedDocument, LineItem, OptionItem, Party
 
 TITLE_RE = re.compile(r"^(tax\s+invoice|invoice|quotation|quote|estimate|proforma.*|pro-forma.*|credit note|debit note|purchase order|bill of supply|original.*|duplicate.*)$", re.I)
 BUYER_LABEL = re.compile(r"^\s*(?:bill(?:ed)?\s+to|buyer|customer|sold\s+to|ship(?:ped)?\s+to|to)\s*[:\-]\s*(?P<rest>.*)$|^\s*(?:bill(?:ed)?\s+to|buyer|customer|sold\s+to)\s*(?P<rest2>)$", re.I)
 
 NUMBER_LABELS = {
-    DocType.QUOTATION: r"(?:quotation|quote|estimate)\s*(?:no\.?|number|#|ref\.?)",
+    DocType.QUOTATION: r"(?:(?:quotation|quote|estimate)\s*(?:no\.?|number|#|ref\.?)|(?:quotation|quote)\s*(?=:)|sales\s+agreement|document\s*#)",
     DocType.INVOICE: r"(?:invoice|inv|bill)\s*(?:no\.?|number|#)",
     DocType.PROFORMA: r"(?:pro[\s-]?forma\s*(?:invoice)?|pi)\s*(?:no\.?|number|#)",
     DocType.CREDIT_NOTE: r"(?:credit|debit)\s*note\s*(?:no\.?|number|#)",
     DocType.PURCHASE_ORDER: r"(?:purchase\s*order|p\.?o\.?)\s*(?:no\.?|number|#)",
 }
-DOC_NO_VALUE = r"\s*[:\-.]?\s*([A-Z0-9][A-Z0-9/\-_.]{1,40})"
+DOC_NO_VALUE = r"\s*[:\-.]?\s*#?\s*([A-Z0-9][A-Z0-9/\-_.]{1,40})"
 
 TOTAL_PATTERNS = [
     ("total", r"(grand\s+total|total\s+amount\s+(payable|due)|amount\s+payable|net\s+payable|total\s+payable|invoice\s+total|balance\s+due|total\s+due)"),
@@ -38,6 +40,13 @@ TOTAL_PATTERNS = [
     ("round_off", r"\bround(ed)?[\s-]*off\b|\brounding\b"),
 ]
 HEADER_SYNONYMS = {
+    # Dealer-quote columns first: "Base Price" must not be taken as unit price, "Margin %" not as margin amount.
+    "series": ["series", "product line", "range"],
+    "model": ["model", "variant"],
+    "options": ["options", "option", "accessories", "add-ons", "addons", "optional"],
+    "base_price": ["base price", "basic price", "ex-showroom", "ex showroom", "list price"],
+    "margin_percent": ["margin %", "margin%", "margin by %", "margin (%)", "margin pct", "margin percent"],
+    "margin_amount": ["margin by", "margin amount", "margin amt", "dealer margin", "margin"],
     "description": ["description", "item", "particulars", "product", "service", "details", "goods"],
     "hsn_sac": ["hsn", "sac"],
     "quantity": ["qty", "quantity", "nos", "units"],
@@ -47,6 +56,122 @@ HEADER_SYNONYMS = {
     "tax_rate": ["gst %", "gst%", "tax %", "tax%", "gst rate", "tax rate", "vat %"],
     "amount": ["amount", "total", "value", "line total", "taxable"],
 }
+
+
+# ---------- dealer-quote fields: series, model, options, base price, margin, notes ----------
+# Where a merged line's next label starts: only a keyword followed by its separator counts,
+# so values like "5E Series" or "Valid for 30 days" aren't cut.
+_LABEL_CUT = re.compile(
+    r"\s{2,}|\s+(?=(?:quotation|quote|invoice|ref)\s*(?:no\.?|#|number)\b"
+    r"|(?:date|dated|valid\s+(?:until|till|upto)|gstin|series|model|base\s+price|(?:dealer\s+)?margin)\s*[:\-])",
+    re.I,
+)
+_STOP_LINE = re.compile(
+    r"^\s*(sub[\s-]?total|total|grand|cgst|sgst|igst|tax|gst|discount|round|amount|payment|terms|remarks?|notes?|comments?|"
+    r"series|model|base\s+price|basic\s+price|(dealer\s+)?margin|for\s+|authori[sz]ed|bank|delivery|warranty|"
+    r"bill\s+to|ship\s+to|qty|description|#)\b",
+    re.I,
+)
+_OPTIONS_HEADER = re.compile(
+    r"^\s*(optional\s+(?:equipment|accessories|extras|fitments)|options?|accessories|add[\s-]?ons|extras)\b\s*(?:included|selected)?\s*[:\-]?\s*(.*)$",
+    re.I,
+)
+_NOTES_HEADER = re.compile(r"^\s*(remarks?|notes?|comments?|special\s+(?:instructions|notes))\s*[:\-]\s*(.*)$", re.I)
+
+
+def _cut(value: str) -> str:
+    return _LABEL_CUT.split(value, maxsplit=1)[0].strip(" :-|,")
+
+
+def _option_from(text: str) -> OptionItem | None:
+    text = re.sub(r"^\s*(?:[-•*·]|\d{1,2}[.)])\s*", "", text).strip(" ,;")
+    if not re.search(r"[A-Za-z]", text):
+        return None
+    m = re.match(r"^(.*?[A-Za-z].*?)[\s:@-]*(?:₹|rs\.?|inr)?\s*((?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?)\s*(?:/-)?$", text, re.I)
+    if m and not re.search(r"\d\s*%$", text):
+        return OptionItem(name=m.group(1).strip(" :-"), price=parse_amount(m.group(2)))
+    return OptionItem(name=text)
+
+
+def parse_options_text(text: str) -> list[OptionItem]:
+    """'Loader 1,20,000; Rotavator 65,000' -> named options with prices. Commas inside amounts are kept."""
+    parts = re.split(r";|\n|\s\|\s|\s\+\s|,(?!\d)", text or "")
+    return [o for p in parts if p.strip() and (o := _option_from(p))]
+
+
+def dealer_fields(lines: list[str]) -> dict:
+    """Labelled dealer-quote values from anywhere in the text."""
+    out: dict = {"options": []}
+    for i, ln in enumerate(lines):
+        if out.get("series") is None and (m := re.search(r"\bseries\s*[:\-]\s*(.+)", ln, re.I)):
+            out["series"] = _cut(m.group(1)) or None
+        if out.get("model") is None and (m := re.search(r"\bmodel(?:\s*(?:no\.?|name|number|code))?\s*[:\-]\s*(.+)", ln, re.I)):
+            out["model"] = _cut(m.group(1)) or None
+        if out.get("base_price") is None and (m := re.search(
+                r"\b(?:base|basic|ex[\s-]?showroom|list)\s+price\b[^\d]*((?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?)", ln, re.I)):
+            out["base_price"] = parse_amount(m.group(1))
+        if re.search(r"\bmargin\b", ln, re.I) and not re.search(r"\bcost\s+margin\b|approximate|keep all", ln, re.I):
+            pct_m = re.search(r"(\d+(?:\.\d+)?)\s*%", ln)
+            if out.get("margin_percent") is None and pct_m and float(pct_m.group(1)) > 0:
+                out["margin_percent"] = float(pct_m.group(1))
+            elif out.get("margin_percent") is None and re.search(r"margin(?:\s+by)?\s*(?:%|percent|pct|percentage|\(%\))", ln, re.I):
+                nums = [n for n in amounts_in(ln) if n > 0]
+                out["margin_percent"] = nums[-1] if nums else None
+            elif out.get("margin_amount") is None:
+                nums = [n for n in amounts_in(ln) if n > 0]  # "Calculated Margin $0.00" is an empty field, not a margin
+                if nums:
+                    out["margin_amount"] = nums[-1]
+        if not out["options"] and (m := _OPTIONS_HEADER.match(ln)):
+            inline = m.group(2).strip()
+            if inline:
+                out["options"] = parse_options_text(inline)
+            else:
+                for nxt in lines[i + 1 : i + 16]:
+                    if _STOP_LINE.match(nxt) or any(re.search(p, nxt.lower()) for _, p in TOTAL_PATTERNS[:2]):
+                        break
+                    if (opt := _option_from(nxt)) is not None:
+                        out["options"].append(opt)
+        if out.get("notes") is None and (m := _NOTES_HEADER.match(ln)):
+            parts = [m.group(2).strip()] if m.group(2).strip() else []
+            for nxt in lines[i + 1 : i + 5]:
+                if _STOP_LINE.match(nxt) or re.match(r"^[A-Z][\w /&]{2,30}:\s", nxt):
+                    break
+                parts.append(nxt.strip())
+            out["notes"] = " ".join(parts)[:1000] or None
+    return out
+
+
+def apply_dealer_fields(doc: ExtractedDocument, f: dict, warnings: list[str]) -> None:
+    """Attach header-level dealer fields to the quote and, for single-unit quotes, to its line item."""
+    doc.notes = doc.notes or f.get("notes")
+    if f.get("margin_amount") is not None:
+        doc.margin_amount = doc.margin_amount if doc.margin_amount is not None else f["margin_amount"]
+    if f.get("margin_percent") is not None:
+        doc.margin_percent = doc.margin_percent if doc.margin_percent is not None else f["margin_percent"]
+    unit_fields = {k: f.get(k) for k in ("series", "model", "base_price", "margin_amount", "margin_percent")}
+    has_unit = f.get("model") or f.get("series") or f.get("base_price") is not None or f["options"]
+    if not has_unit:
+        return
+    if not doc.line_items:
+        # Single-unit quote laid out as labels rather than a table: build its line from the labels.
+        base = f.get("base_price")
+        opts = f["options"]
+        priced = base is not None and all(o.price is not None for o in opts)
+        unit_price = round(base + sum(o.price for o in opts), 2) if priced else None
+        doc.line_items = [LineItem(
+            description=" ".join(filter(None, [f.get("series"), f.get("model")])) or "Quoted unit",
+            quantity=1 if unit_price is not None else None, unit_price=unit_price, amount=unit_price,
+            options=opts, **unit_fields,
+        )]
+        if unit_price is not None:
+            warnings.append("line amount derived from base price + options")
+    elif len(doc.line_items) == 1:
+        li = doc.line_items[0]
+        for k, v in unit_fields.items():
+            if getattr(li, k) is None and v is not None:
+                setattr(li, k, v)
+        if not li.options and f["options"]:
+            li.options = f["options"]
 
 
 def clean_ocr_text(text: str) -> str:
@@ -65,15 +190,21 @@ class RulesEngine:
         return True
 
     def extract(self, ctx: DocumentContext, doc_type_hint: DocType | None = None) -> EngineResult:
-        text = clean_ocr_text(ctx.text)
+        text = clean_ocr_text(normalize_dashes(ctx.text))
         lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("--- page")]
         doc = ExtractedDocument(document_type=doc_type_hint or DocType.OTHER)
         warnings: list[str] = []
+        us = us_quote.is_us(text)
+        dayfirst = not us  # US documents write dates month-first (02/11/2026 = Feb 11)
 
         doc.document_number = self._doc_number(text, doc.document_type)
-        doc.document_date = self._labeled_date(text, r"(?:invoice|quotation|quote|bill|document|issue)?\s*date(?:d)?")
-        doc.due_date = self._labeled_date(text, r"(?:due\s+date|payment\s+due|due\s+on|due\s+by)")
-        doc.valid_until = self._labeled_date(text, r"(?:valid\s+(?:until|till|upto|up\s+to)|validity|expiry\s+date|expires\s+on)")
+        date_text = re.sub(r"(expir\w*|valid\w*|due|delivery|inquiry|ship(?:ping)?|order|printed|birth)\s*date", "_", text, flags=re.I)
+        doc.document_date = self._labeled_date(
+            date_text, r"(?:invoice|quotation|quote|bill|document|issue|effective)?\s*(?:date(?:d)?(?:\s+issued)?|issued)", dayfirst)
+        doc.due_date = self._labeled_date(text, r"(?:due\s+date|payment\s+due|due\s+on|due\s+by)", dayfirst)
+        doc.valid_until = self._labeled_date(
+            text, r"(?:(?:quote\s+)?valid\s*(?:until|till|upto|up\s+to|through|thru)|validity|expiry\s+date|expiration\s+date|"
+                  r"expires(?:\s+on)?|good\s+(?:through|until))", dayfirst)
         if doc.due_date == doc.document_date and not re.search(r"due", text, re.I):
             doc.due_date = None
         m = re.search(r"(?:p\.?o\.?|purchase\s+order)\s*(?:no\.?|number|#)\s*[:\-]?\s*([A-Z0-9/\-]{2,30})", text, re.I)
@@ -103,6 +234,10 @@ class RulesEngine:
         self._totals(lines, doc)
         doc.payment_terms = self._payment_terms(lines)
         doc.line_items = self._items_from_tables(ctx) or self._items_from_lines(lines)
+        if us:
+            self._apply_us(doc, [ln.strip() for ln in text.splitlines() if ln.strip()], warnings, ctx.filename or "")
+        apply_dealer_fields(doc, dealer_fields(lines), warnings)
+        enrich_models(doc, text)
         if not doc.line_items:
             warnings.append("no line items found")
 
@@ -111,21 +246,52 @@ class RulesEngine:
         )
         return EngineResult(document=doc, engine_confidence=round(found / 5 * 0.9, 2), warnings=warnings)
 
+    @staticmethod
+    def _apply_us(doc: ExtractedDocument, raw_lines: list[str], warnings: list[str], filename: str = "") -> None:
+        parsed = us_quote.parse_items(raw_lines)
+        if parsed.items and (not doc.line_items or not any(li.amount for li in doc.line_items)
+                             or len([li for li in parsed.items if li.model]) >= len([li for li in doc.line_items if li.model])):
+            doc.line_items = parsed.items
+        totals = us_quote.parse_totals([ln for ln in raw_lines if not ln.startswith("--- page")])
+        for fld in ("total", "subtotal", "tax_total"):
+            if fld in totals:
+                setattr(doc, fld, totals[fld])
+        charges = us_quote.parse_charges(raw_lines)
+        doc.other_charges = charges["fees"] or None
+        doc.trade_in = charges["trade_in"] or None
+        if charges["incentives"]:
+            doc.discount_total = charges["incentives"]
+        if parsed.notes:
+            doc.notes = "; ".join(filter(None, [doc.notes, *parsed.notes]))
+        doc.currency = doc.currency or "USD"
+        dealer = us_quote.dealer_name(raw_lines, filename)
+        doc.vendor.name = dealer  # None when the dealer name is only in a logo: escalate / review instead of guessing
+        if doc.buyer.name and dealer and doc.buyer.name.lower() == dealer.lower():
+            doc.buyer.name = None
+        if not doc.vendor.gstin:  # US documents carry no GST; any CGST/SGST/IGST hits are stray matches
+            doc.cgst = doc.sgst = doc.igst = doc.cess = None
+
     # ---------- header fields ----------
     @staticmethod
     def _doc_number(text: str, doc_type: DocType) -> str | None:
         order = [NUMBER_LABELS.get(doc_type)] if doc_type in NUMBER_LABELS else []
         order += [p for t, p in NUMBER_LABELS.items() if t != doc_type]
+        order.append(r"(?:quote\s*id|document\s*(?:no\.?|number|#))")
         for label in filter(None, order):
-            m = re.search(label + DOC_NO_VALUE, text, re.I)
-            if m and re.search(r"\d", m.group(1)) and not re.fullmatch(DATE_TOKEN, m.group(1)):
-                return m.group(1).rstrip(".-/")
+            for m in re.finditer(label + DOC_NO_VALUE, text, re.I):
+                value = m.group(1).rstrip(".-/")
+                if not re.search(r"\d", value) or re.fullmatch(DATE_TOKEN, value) or re.fullmatch(r"[A-Z0-9]{1,4}-0", value, re.I):
+                    continue  # no digits, a date, or an empty-template placeholder like "100-0"
+                return value
         return None
 
     @staticmethod
-    def _labeled_date(text: str, label: str) -> str | None:
-        m = re.search(r"\b" + label + r"\s*[:\-]?\s*" + DATE_TOKEN, text, re.I)
-        return parse_date(m.group(1)) if m else None
+    def _labeled_date(text: str, label: str, dayfirst: bool = True) -> str | None:
+        weekday = r"(?:(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri|sat(?:ur)?|sun)(?:day)?,?\s+)?"
+        for m in re.finditer(r"\b" + label + r"\s*[:\-]?\s*" + weekday + DATE_TOKEN, text, re.I):
+            if (d := parse_date(m.group(1), dayfirst=dayfirst)) is not None:
+                return d
+        return None
 
     @staticmethod
     def _currency(text: str) -> str | None:
@@ -228,7 +394,9 @@ class RulesEngine:
                         # "Total"/"Taxable" header only means amount if we don't already have it
                         cols[field_name] = ci
                         break
-            if "description" in cols and "amount" in cols and ("quantity" in cols or "unit_price" in cols):
+            has_item = "description" in cols or "model" in cols
+            has_price = "amount" in cols or "base_price" in cols
+            if has_item and has_price and ("quantity" in cols or "unit_price" in cols or "base_price" in cols):
                 return idx, cols
         return None, {}
 
@@ -238,13 +406,21 @@ class RulesEngine:
             i = cols.get(name)
             return row[i] if i is not None and i < len(row) and row[i] else None
 
-        desc = cell("description")
+        desc = cell("description") or " ".join(filter(None, [cell("series"), cell("model")])) or None
         amount = parse_amount(cell("amount"))
-        if not desc or amount is None or re.match(r"^(sub\s*total|total|grand|cgst|sgst|igst|tax|discount|round)", desc, re.I):
+        base = parse_amount(cell("base_price"))
+        if not desc or (amount is None and base is None) or re.match(r"^(sub\s*total|total|grand|cgst|sgst|igst|tax|discount|round)", desc, re.I):
             return None
         rate = cell("tax_rate")
+        pct = cell("margin_percent")
         return LineItem(
             description=desc,
+            series=cell("series"),
+            model=cell("model"),
+            options=parse_options_text(cell("options") or ""),
+            base_price=base,
+            margin_amount=parse_amount(cell("margin_amount")),
+            margin_percent=parse_amount(pct.replace("%", "")) if pct else None,
             hsn_sac=cell("hsn_sac"),
             quantity=parse_amount(cell("quantity")),
             unit=cell("unit"),
@@ -279,6 +455,10 @@ class RulesEngine:
                 hsn_code = hsn.group(1) if hsn else (raw_nums[0] if len(nums) >= 4 and re.fullmatch(r"\d{4,8}", raw_nums[0]) else None)
                 items.append(LineItem(description=desc, quantity=qty, unit_price=price, amount=amount, hsn_sac=hsn_code))
         return items
+
+
+MAX_VARIANT_PAGES = 3
+OCR_VARIANT_BUDGET_S = 45.0
 
 
 class LocalOcrRulesEngine(RulesEngine):
@@ -316,11 +496,19 @@ class LocalOcrRulesEngine(RulesEngine):
             r.warnings.append(f"ocr variant: {label}")
             return r, validate(r.document, r.engine_confidence)
 
+        import time
+
+        started = time.monotonic()
         candidates = [run(ctx, "lines_removed")]
-        has_ocr = any(p.text_source == "ocr" for p in ctx.pages)
-        for variant in list(OCR_VARIANTS)[1:] if has_ocr else []:
+        ocr_pages = sum(1 for p in ctx.pages if p.text_source == "ocr")
+        # Extra variants cost one OCR pass per page each; long scans go to Azure instead of burning minutes here
+        extra = list(OCR_VARIANTS)[1:] if 0 < ocr_pages <= MAX_VARIANT_PAGES else []
+        for variant in extra:
             if any(v.passed for _, v in candidates):
                 break  # stop at the first variant that validates
+            if time.monotonic() - started > OCR_VARIANT_BUDGET_S:
+                candidates[0][0].warnings.append("ocr variant time budget reached")
+                break
             candidates.append(run(replace(ctx, pages=ocr_variant_pages(ctx, variant)), variant))
 
         candidates.sort(key=lambda c: c[1].score, reverse=True)
