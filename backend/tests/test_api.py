@@ -127,3 +127,26 @@ def test_duplicate_invoice_is_flagged(client, sample_dir):
     r = client.post("/api/documents/upload", files={"files": ("copy-of-invoice.pdf", invoice_pdf() + b"\n%copy", "application/pdf")})
     dup = client.get(f"/api/documents/{r.json()['documents'][0]['id']}").json()
     assert dup["status"] == "needs_review" and f"duplicate of document #{first['id']}" in dup["error"]
+
+
+def test_dealer_quote_end_to_end_and_review_derives_margin(client):
+    from tests.samples import dealer_quote_pdf
+
+    r = client.post("/api/documents/upload", files={"files": ("dealer_quote.pdf", dealer_quote_pdf(), "application/pdf")})
+    doc_id = r.json()["documents"][0]["id"]
+    doc = client.get(f"/api/documents/{doc_id}").json()
+    assert doc["status"] == "extracted" and doc["final_engine"] == "rules"
+    data = doc["record"]["data"]
+    li = data["line_items"][0]
+    assert (li["series"], li["model"], li["base_price"], li["margin_percent"]) == ("5E Series", "5050E 4WD", 850000, 5)
+    assert len(li["options"]) == 2 and data["notes"].startswith("Delivery")
+
+    rec = next(x for x in client.get("/api/records", params={"doc_type": "quotation"}).json()["items"] if x["document_id"] == doc_id)
+    assert rec["margin_amount"] == 51750
+
+    # Reviewer changes the margin to 6% and clears the amount: the amount is recalculated
+    data["line_items"][0].update(margin_percent=6, margin_amount=None)
+    data.update(margin_percent=None, margin_amount=None)
+    body = client.post(f"/api/documents/{doc_id}/review", json={"action": "correct", "data": data}).json()
+    new = body["record"]["data"]
+    assert new["line_items"][0]["margin_amount"] == 62100 and new["margin_amount"] == 62100 and new["margin_percent"] == 6

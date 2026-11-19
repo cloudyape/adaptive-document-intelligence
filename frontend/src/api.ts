@@ -2,16 +2,23 @@ export type Status = 'received' | 'ignored' | 'processing' | 'extracted' | 'need
 export type Complexity = 'easy' | 'medium' | 'difficult'
 
 export interface Party { name: string | null; address?: string | null; gstin: string | null; pan?: string | null; email?: string | null; phone?: string | null }
+export interface OptionItem { name: string; price: number | null }
 export interface LineItem {
   description: string | null; hsn_sac: string | null; quantity: number | null; unit: string | null
   unit_price: number | null; discount: number | null; tax_rate: number | null; amount: number | null
+  series: string | null; model: string | null; options: OptionItem[]; base_price: number | null; msrp?: number | null
+  margin_amount: number | null; margin_percent: number | null
 }
+export interface PriceFile { id: number; filename: string; uploaded_at: string; uploaded_by: string | null; active: boolean; row_count: number; warnings: string[] }
+export interface PriceEntry { model_number: string; description: string | null; dealer_cost: number | null; msrp: number | null }
 export interface Extracted {
   document_type: string; document_number: string | null; document_date: string | null; due_date: string | null
   valid_until: string | null; po_number: string | null; currency: string | null; vendor: Party; buyer: Party
   line_items: LineItem[]; subtotal: number | null; discount_total: number | null; cgst: number | null; sgst: number | null
   igst: number | null; cess: number | null; tax_total: number | null; shipping: number | null; round_off: number | null
   total: number | null; payment_terms: string | null; notes: string | null
+  margin_amount: number | null; margin_percent: number | null; margin_source?: string | null
+  other_charges?: number | null; trade_in?: number | null
 }
 export interface Issue { field: string; code: string; message: string; severity: 'critical' | 'error' | 'warning' }
 export interface Attempt {
@@ -78,6 +85,16 @@ export const api = {
   review: (id: number, body: { action: 'approve' | 'reject' | 'correct'; reviewer?: string; comment?: string; data?: Extracted }) =>
     req<DocDetail>(`/documents/${id}/review`, json(body)),
   records: (params: Record<string, string> = {}) => req<{ items: (Extracted & { id: number; document_id: number; verified: boolean })[] }>(`/records?${new URLSearchParams(params)}`),
+  priceFiles: () => req<{ items: PriceFile[] }>('/price-files'),
+  priceEntries: (id: number, q = '') => req<{ items: PriceEntry[] }>(`/price-files/${id}/entries?q=${encodeURIComponent(q)}`),
+  uploadPriceFile: (file: File, uploadedBy?: string) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const qs = uploadedBy ? `?uploaded_by=${encodeURIComponent(uploadedBy)}` : ''
+    return req<PriceFile & { records_recalculated: number }>(`/price-files${qs}`, { method: 'POST', body: fd })
+  },
+  setPriceFileActive: (id: number, active: boolean) =>
+    req<PriceFile & { records_recalculated: number }>(`/price-files/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }),
   ingestNow: () => req<{ messages: number; documents: number; skipped_existing: number }>('/ingest/run', { method: 'POST' }),
 }
 

@@ -11,6 +11,7 @@ const router = createRouter({
     { path: '/documents/:id', component: () => import('./views/DocumentDetail.vue'), props: true },
     { path: '/review', component: () => import('./views/ReviewQueue.vue') },
     { path: '/records', component: () => import('./views/Records.vue') },
+    { path: '/price-files', component: () => import('./views/PriceFiles.vue') },
   ],
 })
 

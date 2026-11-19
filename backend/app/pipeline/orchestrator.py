@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.pipeline.engines.azure_di import AzureHighResFallback, AzureInvoiceEngine, AzureReadRulesEngine
 from app.pipeline.engines.base import Engine, EngineResult, EngineUnavailable
 from app.pipeline.engines.rules import LocalOcrRulesEngine, RulesEngine
+from app.pipeline.derive import derive
 from app.pipeline.preprocess import DocumentContext
 from app.pipeline.validation import ValidationReport, validate
 from app.schemas import Complexity, DocType
@@ -91,6 +92,7 @@ class Orchestrator:
                 result = engine.extract(ctx, doc_type)
                 if doc_type and result.document.document_type == DocType.OTHER:
                     result.document.document_type = doc_type
+                result.warnings.extend(derive(result.document))
                 attempt.result = result
                 attempt.validation = validate(result.document, result.engine_confidence)
             except EngineUnavailable as exc:

@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 PDF_MIME = "application/pdf"
 IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/tiff", "image/webp", "image/bmp", "image/gif"}
 TEXT_MIMES = {"text/plain", "text/html", "text/csv"}
+EXCEL_MIMES = {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.ms-excel.sheet.macroenabled.12"}
 
 
 def _tesseract_available() -> bool:
@@ -78,7 +79,7 @@ class DocumentContext:
 
     @property
     def is_text(self) -> bool:
-        return self.mime_type in TEXT_MIMES
+        return self.mime_type in TEXT_MIMES or self.mime_type in EXCEL_MIMES
 
     @property
     def page_count(self) -> int:
@@ -269,8 +270,83 @@ def ocr_variant_pages(ctx: "DocumentContext", variant: str) -> list[PageInfo]:
     return pages
 
 
+THIN_TEXT_CHARS = 600
+
+
+def form_fields_text(page) -> str:
+    """Values typed into a fillable PDF form, as text lines.
+
+    Row-indexed fields (e.g. QUANTITYRow3, DESCRIPTIONRow3, AMOUNTRow3) become one line per row,
+    in column order; other fields become "NAME: value" lines.
+    """
+    def dec(x) -> str:
+        # PDF text strings are UTF-16 when they start with a byte-order mark, else PDFDocEncoding (~latin-1)
+        if isinstance(x, bytes):
+            return x.decode("utf-16") if x.startswith((b"\xfe\xff", b"\xff\xfe")) else x.decode("latin-1")
+        return "" if x is None else str(x).strip("/")
+
+    rows: dict[int, list[tuple[float, str]]] = {}
+    singles: list[tuple[float, str]] = []
+    try:
+        annots = page.annots or []
+    except Exception as exc:  # noqa: BLE001 - malformed/recursive annotation trees: skip form fields, keep the page
+        log.warning("could not read form fields on page %s: %s", page.page_number, type(exc).__name__)
+        return ""
+    for a in annots:
+        d = a.get("data") or {}
+        name, value = dec(d.get("T")), dec(d.get("V")).strip()
+        if not value or value.lower() in ("off", "no"):
+            continue
+        x = float(a.get("x0") or 0)
+        m = re.match(r"^(.*?)[\s_]*row[\s_]*(\d+)$", name, re.I)
+        if m:
+            rows.setdefault(int(m.group(2)), []).append((x, value))
+        else:
+            singles.append((float(a.get("top") or 0), f"{name}: {value}"))
+    lines = [t for _, t in sorted(singles)]
+    lines += [" ".join(v for _, v in sorted(cells)) for _, cells in sorted(rows.items())]
+    return "\n".join(lines)
+
+
+def excel_text(path: Path) -> list[str]:
+    """One text block per worksheet; each row's non-empty cells joined in order, numbers as money."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    sheets = []
+    for ws in wb.worksheets:
+        if getattr(ws, "sheet_state", "visible") != "visible":
+            continue  # hidden helper / lookup sheets
+        rows = []
+        for row in ws.iter_rows():
+            cells = []
+            for cell in row:
+                c = getattr(cell, "value", None)
+                if c is None or isinstance(c, bool) or (isinstance(c, str) and not c.strip()):
+                    continue
+                if isinstance(c, (int, float)):
+                    fmt = (getattr(cell, "number_format", "") or "").lower()
+                    money_fmt = any(t in fmt for t in ("$", "0.00", "#,##0", "accounting", "currency"))
+                    # phone numbers / ids / horsepower are numeric cells too: only currency-formatted cells are money
+                    cells.append(f"${c:,.2f}" if money_fmt and abs(c) < 1e8 else (f"{c:g}" if isinstance(c, float) else str(c)))
+                elif hasattr(c, "strftime"):
+                    cells.append(c.strftime("%m/%d/%Y"))
+                else:
+                    cells.append(str(c).strip())
+            if cells:
+                rows.append(" ".join(cells))
+        text = "\n".join(rows)
+        if rows and "formula=" not in text:
+            sheets.append(text)
+    return sheets
+
+
 def analyze(path: Path, mime_type: str, filename: str) -> DocumentContext:
     ctx = DocumentContext(path=path, mime_type=mime_type, filename=filename, ocr_available=_tesseract_available())
+
+    if mime_type in EXCEL_MIMES:
+        ctx.pages = [PageInfo(i, t, "text_layer") for i, t in enumerate(excel_text(path), start=1)] or [PageInfo(1)]
+        return ctx
 
     if ctx.is_text:
         raw = path.read_text(errors="replace")
@@ -283,6 +359,9 @@ def analyze(path: Path, mime_type: str, filename: str) -> DocumentContext:
         with pdfplumber.open(str(path)) as pdf:
             for i, page in enumerate(pdf.pages, start=1):
                 text = page.extract_text(layout=False) or ""
+                form = form_fields_text(page)
+                if form:  # fillable PDF: typed values live in form fields, not the page text
+                    text = f"{text}\n{form}" if text.strip() else form
                 area = float(page.width * page.height) or 1.0
                 img_area = sum(float(im["width"] * im["height"]) for im in page.images)
                 try:
@@ -295,12 +374,18 @@ def analyze(path: Path, mime_type: str, filename: str) -> DocumentContext:
                         min(1.0, img_area / area), len(tables), tables,
                     )
                 )
-        # OCR pages that have no text layer (scanned PDFs)
+        # OCR pages with no text layer (scans), and image-covered pages with only a sliver of text
+        # (a scan with a typed header or stamp overlaid) - their real content is in the image.
+        for p in ctx.pages:
+            if p.text_source == "text_layer" and len(p.text.strip()) < THIN_TEXT_CHARS and p.image_coverage > 0.5:
+                p.text_source = "none"
         if ctx.ocr_available and any(p.text_source == "none" for p in ctx.pages):
             images = ctx.page_images()
             for p in ctx.pages:
                 if p.text_source == "none" and p.number - 1 < len(images):
-                    p.text, p.ocr_confidence = _ocr_image(images[p.number - 1])
+                    overlay = p.text.strip()
+                    ocr_text, p.ocr_confidence = _ocr_image(images[p.number - 1])
+                    p.text = ocr_text if not overlay else f"{ocr_text}\n{overlay}"
                     p.text_source = "ocr" if p.text.strip() else "none"
         return ctx
 
