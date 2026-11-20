@@ -36,6 +36,11 @@ class Document(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     email_id: Mapped[int | None] = mapped_column(ForeignKey("emails.id"), index=True)
+    # A merged PDF holding several quotes is a "packet": each quote becomes a child document of its pages.
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    page_texts: Mapped[list | None] = mapped_column(JSONType)  # OCR text already read while splitting (reused)
     source: Mapped[str] = mapped_column(String(32), default="email")  # email | email_body | upload
     filename: Mapped[str] = mapped_column(String(512))
     mime_type: Mapped[str] = mapped_column(String(128))
@@ -59,6 +64,10 @@ class Document(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     email: Mapped[Email | None] = relationship(back_populates="documents")
+    parent: Mapped[Document | None] = relationship(back_populates="children", remote_side="Document.id")
+    children: Mapped[list[Document]] = relationship(
+        back_populates="parent", order_by="Document.page_start", cascade="all, delete-orphan"
+    )
     attempts: Mapped[list[ExtractionAttempt]] = relationship(
         back_populates="document", order_by="ExtractionAttempt.id", cascade="all, delete-orphan"
     )

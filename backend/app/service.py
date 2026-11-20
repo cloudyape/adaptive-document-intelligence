@@ -6,6 +6,7 @@ import logging
 import mimetypes
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -18,7 +19,9 @@ from app.pipeline import complexity as complexity_mod
 from app.pipeline.derive import apply_dealer_costs, derive
 from app.pipeline.identify import identify
 from app.pipeline.orchestrator import Orchestrator
-from app.pipeline.preprocess import analyze
+from app.pipeline.pdfpages import extract_pages, page_count, page_texts
+from app.pipeline.preprocess import PDF_MIME, analyze
+from app.pipeline.split import segment
 from app.pipeline.validation import validate
 from app.schemas import FINANCIAL_TYPES, DocStatus, DocType, ExtractedDocument
 
@@ -59,7 +62,10 @@ def store_document(
     return doc, True
 
 
-def process_document(session: Session, doc_id: int, orchestrator: Orchestrator | None = None) -> Document:
+def process_document(session: Session, doc_id: int, orchestrator: Orchestrator | None = None,
+                     enqueue: Callable[[int], None] | None = None) -> Document:
+    """Extract one document. A merged PDF of several quotes is split first and each quote is processed as a
+    child document: through `enqueue` (background worker) when given, else inline."""
     doc = session.get(Document, doc_id)
     if doc is None:
         raise ValueError(f"document {doc_id} not found")
@@ -70,7 +76,13 @@ def process_document(session: Session, doc_id: int, orchestrator: Orchestrator |
         if doc.mime_type not in SUPPORTED_MIMES:
             # Unsupported formats still go to the document-AI tier rather than being dropped.
             log.info("unsupported mime %s for %s; routing as difficult", doc.mime_type, doc.filename)
-        ctx = analyze(Path(doc.storage_path), doc.mime_type, doc.filename)
+        if doc.parent_id is None and doc.mime_type == PDF_MIME and page_count(Path(doc.storage_path)) >= MIN_PACKET_PAGES:
+            children = split_packet(session, doc)
+            if children:
+                for child_id in children:
+                    (enqueue or (lambda i: process_document(session, i, orchestrator)))(child_id)
+                return session.get(Document, doc_id)
+        ctx = analyze(Path(doc.storage_path), doc.mime_type, doc.filename, ocr_cache=doc.page_texts)
         doc.features = ctx.features()
 
         subject = doc.email.subject if doc.email else ""
@@ -113,8 +125,8 @@ def process_document(session: Session, doc_id: int, orchestrator: Orchestrator |
                 doc.error = "; ".join(best.validation.messages()[:5]) if best.validation else None
             dup = find_duplicate(session, doc)
             if dup:
-                doc.status = DocStatus.NEEDS_REVIEW
-                doc.error = f"possible duplicate of document #{dup}" + (f"; {doc.error}" if doc.error else "")
+                doc.status = DocStatus.DUPLICATE
+                doc.error = f"duplicate of {describe(session.get(Document, dup))}" + (f"; {doc.error}" if doc.error else "")
         else:
             doc.status = DocStatus.NEEDS_REVIEW
             doc.error = "all engines failed: " + "; ".join(f"{a.engine}: {a.error}" for a in outcome.attempts if a.error)
@@ -125,6 +137,89 @@ def process_document(session: Session, doc_id: int, orchestrator: Orchestrator |
         doc.status, doc.error = DocStatus.FAILED, f"{type(exc).__name__}: {exc}"
     session.commit()
     return doc
+
+
+# ---------- merged PDFs ("packets" of several quotes) ----------
+MIN_PACKET_PAGES = 2
+
+
+def describe(doc: Document) -> str:
+    """How a reviewer finds a document: '#12 (Brad quotes.pdf, pages 4-6)'."""
+    where = doc.parent.filename if doc.parent else doc.filename
+    pages = ""
+    if doc.page_start:
+        pages = f", page {doc.page_start}" if doc.page_end == doc.page_start else f", pages {doc.page_start}-{doc.page_end}"
+    return f"document #{doc.id} ({where}{pages})"
+
+
+def _text_fingerprint(texts: list[str]) -> str:
+    """Same pages scanned or printed twice give the same fingerprint (OCR noise aside: letters/digits only)."""
+    norm = "".join(ch for ch in " ".join(texts).upper().translate(_OCR_FOLD) if ch.isalnum())
+    return hashlib.sha256(norm.encode()).hexdigest() if len(norm) >= 40 else ""
+
+
+def split_packet(session: Session, doc: Document) -> list[int]:
+    """Split a merged PDF into one child document per quote. Returns child ids to process ([] = a single quote)."""
+    path = Path(doc.storage_path)
+    pages = page_texts(path)
+    segs = segment([t for t, _ in pages])
+    if len(segs) < 2:
+        if any(src == "ocr" for _, src in pages):
+            doc.page_texts = [t if src == "ocr" else "" for t, src in pages]
+        return []
+
+    keep = {c.page_start: c for c in doc.children if c.status in (DocStatus.APPROVED, DocStatus.REJECTED)}
+    for c in list(doc.children):  # reprocessing: rebuild children, but keep reviewed ones
+        if c.page_start not in keep:
+            doc.children.remove(c)
+    session.flush()
+
+    stem = Path(doc.filename).stem
+    seen: dict[str, Document] = {}
+    to_process: list[int] = []
+    for seg in segs:
+        texts = [pages[i - 1][0] for i in seg.pages]
+        label = f"p{seg.start}" if seg.start == seg.end else f"p{seg.start}-{seg.end}"
+        reviewed = keep.get(seg.start)
+        if reviewed and reviewed.page_end == seg.end:
+            child = reviewed
+        else:
+            child = Document(
+                parent=doc, email_id=doc.email_id, source=doc.source, filename=f"{stem} ({label}).pdf"[:500],
+                mime_type=PDF_MIME, sha256=hashlib.sha256(f"{doc.sha256}:{seg.start}-{seg.end}".encode()).hexdigest(),
+                page_start=seg.start, page_end=seg.end, status=DocStatus.RECEIVED,
+                page_texts=[t if pages[i - 1][1] == "ocr" else "" for t, i in zip(texts, seg.pages)],
+            )
+            storage = get_settings().storage_dir
+            storage.mkdir(parents=True, exist_ok=True)
+            data = extract_pages(path, seg.start, seg.end)
+            child.storage_path = str(storage / f"{child.sha256}.pdf")
+            Path(child.storage_path).write_bytes(data)
+            child.size_bytes = len(data)
+            child.complexity_reasons = [f"split from {doc.filename}: {seg.reason}"]
+            session.add(child)
+            session.flush()
+        fp = _text_fingerprint(texts)
+        if fp and fp in seen and child is not reviewed:
+            child.status = DocStatus.DUPLICATE
+            child.error = f"duplicate of {describe(seen[fp])}: the same pages appear twice in this file"
+        elif child is not reviewed:
+            to_process.append(child.id)
+        if fp:
+            seen.setdefault(fp, child)
+
+    doc.status, doc.error = DocStatus.SPLIT, None
+    doc.complexity_reasons = [f"merged PDF: {len(segs)} quotes found in {len(pages)} pages"] + [
+        f"pages {s.start}-{s.end}: {s.reason}" for s in segs]
+    session.commit()
+    return to_process
+
+
+def packet_summary(doc: Document) -> dict:
+    counts: dict[str, int] = {}
+    for c in doc.children:
+        counts[c.status] = counts.get(c.status, 0) + 1
+    return {"quotes": len(doc.children), "by_status": counts}
 
 
 # Characters OCR commonly confuses, folded to one canonical form for duplicate matching.
@@ -147,7 +242,7 @@ def find_duplicate(session: Session, doc: Document) -> int | None:
         FinancialRecord.document_id != doc.id,
         FinancialRecord.doc_type == rec.doc_type,
         FinancialRecord.document_number.is_not(None),
-        Document.status != DocStatus.REJECTED,
+        Document.status.not_in([DocStatus.REJECTED, DocStatus.DUPLICATE]),
     )
     if rec.vendor_gstin:
         stmt = stmt.where(FinancialRecord.vendor_gstin == rec.vendor_gstin)

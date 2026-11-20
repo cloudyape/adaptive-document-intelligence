@@ -20,7 +20,7 @@ from app.models import Document, ExtractionAttempt, FinancialRecord
 from app.pipeline.preprocess import _tesseract_available
 from app.schemas import DocStatus, ExtractedDocument
 from app.models import PriceEntry, PriceFile
-from app.service import guess_mime, import_price_file, recompute_margins, review, store_document
+from app.service import guess_mime, import_price_file, packet_summary, recompute_margins, review, store_document
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -49,6 +49,7 @@ def doc_summary(d: Document) -> dict:
         "vendor_name": rec.vendor_name if rec else None, "document_number": rec.document_number if rec else None,
         "document_date": rec.document_date if rec else None, "total": rec.total if rec else None,
         "currency": rec.currency if rec else None,
+        "parent_id": d.parent_id, "page_start": d.page_start, "page_end": d.page_end,
     }
 
 
@@ -68,13 +69,17 @@ def doc_detail(d: Document) -> dict:
         } for a in d.attempts],
         "reviews": [{"action": r.action, "reviewer": r.reviewer, "comment": r.comment, "changes": r.changes,
                      "created_at": r.created_at} for r in d.reviews],
+        "parent": {"id": d.parent.id, "filename": d.parent.filename} if d.parent else None,
+        "children": [doc_summary(c) for c in d.children],
+        "packet": packet_summary(d) if d.children else None,
     }
 
 
 def _load(session: Session, doc_id: int) -> Document:
     d = session.scalar(select(Document).where(Document.id == doc_id).options(
         selectinload(Document.attempts), selectinload(Document.record), selectinload(Document.reviews),
-        selectinload(Document.email)))
+        selectinload(Document.email), selectinload(Document.parent),
+        selectinload(Document.children).selectinload(Document.record)))
     if d is None:
         raise HTTPException(404, "document not found")
     return d
@@ -137,9 +142,13 @@ def stats(session: Session = Depends(get_session)) -> dict:
 @app.get("/api/documents")
 def list_documents(
     status: str | None = None, complexity: str | None = None, doc_type: str | None = None, q: str | None = None,
+    parent_id: int | None = None,
     limit: int = Query(50, le=500), offset: int = 0, session: Session = Depends(get_session),
 ) -> dict:
-    stmt = select(Document).outerjoin(FinancialRecord).options(selectinload(Document.record), selectinload(Document.email))
+    stmt = select(Document).outerjoin(FinancialRecord).options(
+        selectinload(Document.record), selectinload(Document.email), selectinload(Document.parent))
+    if parent_id is not None:
+        stmt = stmt.where(Document.parent_id == parent_id)
     if status:
         stmt = stmt.where(Document.status.in_(status.split(",")))
     if complexity:
@@ -151,13 +160,14 @@ def list_documents(
         stmt = stmt.where(or_(Document.filename.ilike(like), FinancialRecord.vendor_name.ilike(like),
                               FinancialRecord.document_number.ilike(like), FinancialRecord.vendor_gstin.ilike(like)))
     total = session.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows = session.scalars(stmt.order_by(Document.created_at.desc(), Document.id.desc()).limit(limit).offset(offset)).all()
+    order = (Document.page_start, Document.id) if parent_id is not None else (Document.created_at.desc(), Document.id.desc())
+    rows = session.scalars(stmt.order_by(*order).limit(limit).offset(offset)).all()
     return {"total": total, "items": [doc_summary(d) for d in rows]}
 
 
 @app.get("/api/review-queue")
 def review_queue(session: Session = Depends(get_session)) -> dict:
-    return list_documents(status=f"{DocStatus.NEEDS_REVIEW},{DocStatus.FAILED}", limit=200, session=session)
+    return list_documents(status=f"{DocStatus.NEEDS_REVIEW},{DocStatus.FAILED},{DocStatus.DUPLICATE}", limit=200, session=session)
 
 
 @app.get("/api/documents/{doc_id}")

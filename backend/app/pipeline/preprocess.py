@@ -341,7 +341,8 @@ def excel_text(path: Path) -> list[str]:
     return sheets
 
 
-def analyze(path: Path, mime_type: str, filename: str) -> DocumentContext:
+def analyze(path: Path, mime_type: str, filename: str, ocr_cache: list[str] | None = None) -> DocumentContext:
+    """`ocr_cache`: per-page OCR text read earlier (when a merged PDF was split) so scans aren't OCR'd twice."""
     ctx = DocumentContext(path=path, mime_type=mime_type, filename=filename, ocr_available=_tesseract_available())
 
     if mime_type in EXCEL_MIMES:
@@ -379,6 +380,10 @@ def analyze(path: Path, mime_type: str, filename: str) -> DocumentContext:
         for p in ctx.pages:
             if p.text_source == "text_layer" and len(p.text.strip()) < THIN_TEXT_CHARS and p.image_coverage > 0.5:
                 p.text_source = "none"
+        if ocr_cache and len(ocr_cache) == len(ctx.pages):
+            for p, cached in zip(ctx.pages, ocr_cache):
+                if p.text_source == "none" and cached and cached.strip():
+                    p.text, p.text_source = cached, "ocr"
         if ctx.ocr_available and any(p.text_source == "none" for p in ctx.pages):
             images = ctx.page_images()
             for p in ctx.pages:

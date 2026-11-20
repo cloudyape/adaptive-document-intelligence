@@ -33,6 +33,8 @@ class DocStatus(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     FAILED = "failed"
+    DUPLICATE = "duplicate"  # same quote as an earlier document (shown with a reason, kept for review)
+    SPLIT = "split"  # a merged PDF: its quotes are child documents
 
 
 class Party(BaseModel):

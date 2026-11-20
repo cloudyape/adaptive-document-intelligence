@@ -30,7 +30,8 @@ async function load(resetForm = true) {
   doc.value = await api.document(props.id)
   if (resetForm) form.value = clone(doc.value.record?.data ?? emptyDoc())
   clearInterval(timer)
-  if (['received', 'processing'].includes(doc.value.status)) timer = window.setInterval(() => load(), 2000)
+  const busyChild = doc.value.children.some((c) => ['received', 'processing'].includes(c.status))
+  if (['received', 'processing'].includes(doc.value.status) || busyChild) timer = window.setInterval(() => load(false), 3000)
 }
 onMounted(() => load())
 onUnmounted(() => clearInterval(timer))
@@ -46,6 +47,11 @@ const fieldClass = (field: string) => {
 const lineSum = computed(() => form.value?.line_items.reduce((s, li) => s + (Number(li.amount) || 0), 0) ?? 0)
 const canReview = computed(() => doc.value && !['received', 'processing', 'ignored'].includes(doc.value.status))
 const isImage = computed(() => doc.value?.mime_type.startsWith('image/'))
+const pages = (d: { page_start: number | null; page_end: number | null }) =>
+  d.page_start == null ? '' : d.page_end === d.page_start ? `${d.page_start}` : `${d.page_start}–${d.page_end}`
+const reason = (c: DocDetail['children'][number]) =>
+  c.error ?? ({ extracted: 'Passed validation', approved: 'Approved', ignored: 'Not a quote or invoice', received: 'Waiting…', processing: 'Extracting…' } as Record<string, string>)[c.status] ?? '—'
+const packetOrder = ['extracted', 'approved', 'needs_review', 'duplicate', 'failed', 'ignored', 'rejected', 'processing', 'received']
 const sevClass: Record<string, string> = { critical: 'text-rose-700', error: 'text-rose-600', warning: 'text-amber-700' }
 
 function num(v: unknown): number | null {
@@ -141,7 +147,52 @@ const lineFields: [keyof LineItem, string, boolean, boolean?][] = [
       Identified as not a financial document ({{ pct(doc.identification_confidence) }} confidence). Reprocess or correct the data below if this is wrong.
     </div>
 
-    <div class="grid gap-4 xl:grid-cols-2">
+    <div v-if="doc.parent" class="card p-3 text-sm text-slate-600">
+      Quote on page{{ doc.page_start === doc.page_end ? '' : 's' }} {{ pages(doc) }} of
+      <RouterLink :to="`/documents/${doc.parent.id}`" class="text-indigo-600 hover:underline">{{ doc.parent.filename }}</RouterLink>
+    </div>
+
+    <!-- Merged PDF: one row per quote found in it -->
+    <section v-if="doc.packet" class="space-y-3">
+      <div class="card flex flex-wrap items-center gap-x-4 gap-y-2 p-4 text-sm">
+        <span class="font-medium">{{ doc.packet.quotes }} quotes found in this PDF</span>
+        <span v-for="s in packetOrder.filter((k) => doc!.packet!.by_status[k])" :key="s" class="flex items-center gap-1">
+          <StatusBadge :status="s" /> {{ doc.packet.by_status[s] }}
+        </span>
+      </div>
+      <div class="card overflow-x-auto">
+        <table class="min-w-full divide-y divide-slate-100">
+          <thead>
+            <tr>
+              <th class="th">#</th><th class="th">Pages</th><th class="th">Status</th><th class="th">Dealer</th><th class="th">Quote no.</th>
+              <th class="th">Date</th><th class="th text-right">Total</th><th class="th">Reason</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            <tr v-for="(c, i) in doc.children" :key="c.id" class="cursor-pointer hover:bg-slate-50" @click="$router.push(`/documents/${c.id}`)">
+              <td class="td text-slate-500">{{ i + 1 }}</td>
+              <td class="td whitespace-nowrap tabular-nums">{{ pages(c) }}</td>
+              <td class="td"><StatusBadge :status="c.status" /></td>
+              <td class="td max-w-48 truncate">{{ c.vendor_name ?? '—' }}</td>
+              <td class="td whitespace-nowrap">{{ c.document_number ?? '—' }}</td>
+              <td class="td whitespace-nowrap">{{ c.document_date ?? '—' }}</td>
+              <td class="td text-right tabular-nums">{{ money(c.total, c.currency) }}</td>
+              <td class="td max-w-md text-xs" :class="['failed', 'duplicate', 'needs_review'].includes(c.status) ? 'text-rose-700' : 'text-slate-500'">
+                <div class="line-clamp-2" :title="reason(c)">{{ reason(c) }}</div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <details class="card p-4 text-sm">
+        <summary class="cursor-pointer font-medium">How the PDF was split</summary>
+        <ul class="mt-2 space-y-0.5 font-mono text-xs text-slate-600">
+          <li v-for="r in doc.complexity_reasons" :key="r">{{ r }}</li>
+        </ul>
+      </details>
+    </section>
+
+    <div v-if="!doc.packet" class="grid gap-4 xl:grid-cols-2">
       <!-- Original -->
       <section class="card overflow-hidden xl:sticky xl:top-4 xl:self-start">
         <img v-if="isImage" :src="api.fileUrl(doc.id)" class="w-full" alt="Original document" />
