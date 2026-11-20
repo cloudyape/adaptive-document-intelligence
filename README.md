@@ -44,7 +44,7 @@ Outlook ──Graph──▶ identify ──▶ classify complexity ──▶ ro
   from your Azure pricing.
 - **Without Azure configured**, tiers 3–5 are skipped and anything the local engines can't validate goes to review.
 - **Dedupe.** Files are deduplicated by SHA-256. A document with the same vendor and number as an earlier one
-  is flagged as a possible duplicate.
+  (and the same total or date) gets the status `duplicate`, with the document it repeats as the reason.
 
 ## Extracted fields
 
@@ -98,6 +98,26 @@ patterns rather than per-dealer templates (`backend/app/pipeline/engines/us_quot
 - **Fillable PDF forms and Excel quotes:** values are read from form fields and from visible, currency-formatted
   cells.
 
+### Merged PDFs (several quotes in one file)
+
+Dealers often send one PDF holding many quotes: digital quotes, scans, terms pages and finance worksheets
+stapled together. Every PDF of two or more pages is checked first (`backend/app/pipeline/split.py`):
+
+1. Each page's text is read: the text layer, or OCR for scanned pages. The OCR text is reused when the quote is
+   extracted, so scans aren't read twice.
+2. A new quote starts on evidence, strongest first: a "Page 1 of N" marker, a different quote/order number, a
+   new letterhead after the previous quote reached its total, or a quote page after a terms-and-conditions page.
+   Terms, warranty and blank pages stay with the quote before them. With no evidence, a page stays with the
+   current quote, because merging two quotes is caught by validation, while a quote cut in half is not.
+3. Each quote becomes its own document (`<file> (p4-6).pdf`) and goes through the normal routing and validation.
+   The merged PDF is shown as **merged PDF**, with a table of every quote found: pages, status, dealer, number,
+   date, total, and the **reason** for any quote that failed or needs review.
+4. **Duplicates** are listed too, with status `duplicate` and which document they repeat: the same pages appearing
+   twice in the file, or a quote already extracted from another document (same dealer and number, plus the same
+   total or date). Duplicates go to the review queue, and a reviewer can still approve one.
+
+Reprocessing a merged PDF splits it again but keeps quotes that were already approved or rejected.
+
 ## Run it
 
 **With Docker** (PostgreSQL + API + dashboard at http://localhost:8080):
@@ -148,13 +168,13 @@ images (logos and signatures), and treats a financial-looking email body as a do
 | Method | Path | |
 |---|---|---|
 | GET | `/api/stats` | routing mix, per-engine runs/acceptance/spend, straight-through rate |
-| GET | `/api/documents?status=&complexity=&doc_type=&q=` | document list |
-| GET | `/api/documents/{id}` | detail: features, complexity reasons, every attempt with validation, review history |
+| GET | `/api/documents?status=&complexity=&doc_type=&q=&parent_id=` | document list (`parent_id`: the quotes of one merged PDF) |
+| GET | `/api/documents/{id}` | detail: features, complexity reasons, every attempt with validation, review history; for a merged PDF, its quotes (`children`, `packet`) |
 | GET | `/api/documents/{id}/file` | original file |
 | POST | `/api/documents/upload` | multipart `files` (manual intake) |
 | POST | `/api/documents/{id}/reprocess` | run the pipeline again |
 | POST | `/api/documents/{id}/review` | `{action: approve\|reject\|correct, reviewer, comment, data?}` |
-| GET | `/api/review-queue` | needs_review + failed |
+| GET | `/api/review-queue` | needs_review + failed + duplicate |
 | GET | `/api/records?vendor=&gstin=&doc_type=&date_from=&date_to=&verified_only=` | standardized output for ERP/accounting |
 | POST | `/api/ingest/run` | pull Outlook now |
 

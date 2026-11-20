@@ -22,7 +22,7 @@ def _process(doc_id: int) -> None:
 
     try:
         with session_scope() as session:
-            doc = process_document(session, doc_id)
+            doc = process_document(session, doc_id, enqueue=enqueue)
             log.info("document %s -> %s via %s ($%.4f)", doc_id, doc.status, doc.final_engine, doc.total_cost_usd)
     except Exception:  # noqa: BLE001
         log.exception("worker failed for document %s", doc_id)

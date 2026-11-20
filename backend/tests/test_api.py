@@ -126,7 +126,7 @@ def test_duplicate_invoice_is_flagged(client, sample_dir):
     first = upload(client, sample_dir / "invoice_digital.pdf", "application/pdf")  # may already exist from earlier test
     r = client.post("/api/documents/upload", files={"files": ("copy-of-invoice.pdf", invoice_pdf() + b"\n%copy", "application/pdf")})
     dup = client.get(f"/api/documents/{r.json()['documents'][0]['id']}").json()
-    assert dup["status"] == "needs_review" and f"duplicate of document #{first['id']}" in dup["error"]
+    assert dup["status"] == "duplicate" and f"duplicate of document #{first['id']}" in dup["error"]
 
 
 def test_dealer_quote_end_to_end_and_review_derives_margin(client):

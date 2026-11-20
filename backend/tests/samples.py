@@ -191,6 +191,51 @@ def letter_pdf() -> bytes:
     return buf.getvalue()
 
 
+def _lines_page(c: canvas.Canvas, lines: list[str]) -> None:
+    y = A4[1] - 20 * mm
+    c.setFont("Helvetica", 10)
+    for line in lines:
+        c.drawString(20 * mm, y, line)
+        y -= 14
+    c.showPage()
+
+
+def _us_quote(c: canvas.Canvas, dealer: str, city: str, number: str, customer: str, model: str, price: str,
+              tax: str, total: str, *, two_pages: bool = False) -> None:
+    head = [dealer, f"{city}", f"Quote #: {number}", "Date: 03/13/2026", f"Customer: {customer}"]
+    body = ["Description Qty Price Amount", f"KUBOTA {model} 1 ${price} ${price}"]
+    sums = [f"Subtotal: ${price}", f"Sales Tax: ${tax}", f"Quote Total: ${total}"]
+    if two_pages:
+        _lines_page(c, ["Page 1 of 2"] + head + body)
+        _lines_page(c, ["Page 2 of 2", dealer, f"Quote #: {number}"] + sums + ["Customer signature: ________"])
+    else:
+        _lines_page(c, head + body + sums)
+
+
+TERMS = ["Terms and Conditions:", "1. The customer named in the sales order on the first page agrees to the terms below."] + [
+    f"{i}. Warranty, arbitration and limitation of liability provisions apply to all equipment sold hereunder and "
+    "the purchaser acknowledges receipt of the manufacturer limited warranty statement." for i in range(2, 14)]
+
+
+def merged_quotes_pdf() -> bytes:
+    """Several dealer quotes merged into one PDF, as dealers send them: a 2-page quote, a quote with a terms
+    page, the first quote again (duplicate), a blank separator, and an empty quote form (fails extraction)."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    _us_quote(c, "Pinecrest Kubota", "Springfield, MS 38601", "PK-1001", "Jane Buyer", "SVL75-3HFWC",
+              "82,500.00", "5,775.00", "88,275.00", two_pages=True)
+    _us_quote(c, "Riverbend Tractor & Equipment", "Riverbend, VA 24400", "RB-2002", "Sam Buyer", "KX040-4R3T",
+              "67,600.00", "3,042.00", "70,642.00")
+    _lines_page(c, TERMS)
+    _us_quote(c, "Pinecrest Kubota", "Springfield, MS 38601", "PK-1001", "Jane Buyer", "SVL75-3HFWC",
+              "82,500.00", "5,775.00", "88,275.00", two_pages=True)
+    _lines_page(c, [])
+    _lines_page(c, ["Acme Equipment Sales", "Tulsa, OK 74101", "SALES QUOTATION", "Customer:", "Date:",
+                    "Description Qty Price Amount", "Subtotal:", "Total: $0.00"])
+    c.save()
+    return buf.getvalue()
+
+
 INVOICE_EMAIL_HTML = f"""<html><body><p>Hi, please find the invoice details below.</p>
 <h3>Quick Prints &amp; Co</h3><p>GSTIN: {VENDOR_GSTIN}</p>
 <p>Tax Invoice No: QP-7781<br>Invoice Date: 05/09/2025</p>
@@ -211,4 +256,5 @@ if __name__ == "__main__":
     (out / "letter.pdf").write_bytes(letter_pdf())
     (out / "invoice_email.html").write_text(INVOICE_EMAIL_HTML)
     (out / "dealer_quote.pdf").write_bytes(dealer_quote_pdf())
+    (out / "merged_quotes.pdf").write_bytes(merged_quotes_pdf())
     print(f"wrote samples to {out}")

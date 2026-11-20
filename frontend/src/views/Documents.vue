@@ -29,7 +29,7 @@ onUnmounted(() => clearInterval(timer))
       <input v-model.lazy="filters.q" class="input max-w-xs" placeholder="Search vendor, number, GSTIN, file…" />
       <select v-model="filters.status" class="input w-auto">
         <option value="">All statuses</option>
-        <option v-for="s in ['extracted', 'needs_review', 'approved', 'rejected', 'processing', 'failed', 'ignored']" :key="s" :value="s">{{ s.replace('_', ' ') }}</option>
+        <option v-for="s in ['extracted', 'needs_review', 'duplicate', 'approved', 'rejected', 'processing', 'failed', 'ignored', 'split']" :key="s" :value="s">{{ s === 'split' ? 'merged PDF' : s.replace('_', ' ') }}</option>
       </select>
       <select v-model="filters.complexity" class="input w-auto">
         <option value="">All complexity</option>

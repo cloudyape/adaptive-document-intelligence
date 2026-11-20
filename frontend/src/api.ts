@@ -1,4 +1,4 @@
-export type Status = 'received' | 'ignored' | 'processing' | 'extracted' | 'needs_review' | 'approved' | 'rejected' | 'failed'
+export type Status = 'received' | 'ignored' | 'processing' | 'extracted' | 'needs_review' | 'approved' | 'rejected' | 'failed' | 'duplicate' | 'split'
 export type Complexity = 'easy' | 'medium' | 'difficult'
 
 export interface Party { name: string | null; address?: string | null; gstin: string | null; pan?: string | null; email?: string | null; phone?: string | null }
@@ -33,6 +33,7 @@ export interface DocSummary {
   total_cost_usd: number; error: string | null; created_at: string; updated_at: string
   email_subject: string | null; email_sender: string | null; vendor_name: string | null
   document_number: string | null; document_date: string | null; total: number | null; currency: string | null
+  parent_id: number | null; page_start: number | null; page_end: number | null
 }
 export interface DocDetail extends DocSummary {
   identification_confidence: number | null; complexity_reasons: string[] | null; features: Record<string, unknown> | null
@@ -41,6 +42,9 @@ export interface DocDetail extends DocSummary {
   record: { id: number; data: Extracted; verified: boolean; verified_by: string | null; verified_at: string | null } | null
   attempts: Attempt[]
   reviews: { action: string; reviewer: string | null; comment: string | null; changes: Record<string, unknown> | null; created_at: string }[]
+  parent: { id: number; filename: string } | null
+  children: DocSummary[]
+  packet: { quotes: number; by_status: Record<string, number> } | null
 }
 export interface Stats {
   documents_total: number; by_status: Record<string, number>; by_complexity: Record<string, number>

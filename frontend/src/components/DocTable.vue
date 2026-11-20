@@ -20,7 +20,10 @@ defineProps<{ items: DocSummary[]; showError?: boolean }>()
         <tr v-for="d in items" :key="d.id" class="cursor-pointer hover:bg-slate-50" @click="$router.push(`/documents/${d.id}`)">
           <td class="td max-w-64">
             <div class="truncate font-medium">{{ d.filename }}</div>
-            <div class="truncate text-xs text-slate-500">{{ d.email_subject ?? d.source }}</div>
+            <div class="truncate text-xs text-slate-500">
+              <template v-if="d.parent_id">pages {{ d.page_start }}<template v-if="d.page_end !== d.page_start">–{{ d.page_end }}</template> of merged PDF #{{ d.parent_id }}</template>
+              <template v-else>{{ d.email_subject ?? d.source }}</template>
+            </div>
             <div v-if="showError && d.error" class="mt-0.5 truncate text-xs text-amber-700" :title="d.error">{{ d.error }}</div>
           </td>
           <td class="td"><StatusBadge :status="d.status" /></td>

@@ -10,11 +10,13 @@ const styles: Record<string, string> = {
   processing: 'bg-sky-50 text-sky-700 ring-sky-200',
   received: 'bg-slate-50 text-slate-600 ring-slate-200',
   ignored: 'bg-slate-50 text-slate-400 ring-slate-200',
+  duplicate: 'bg-violet-50 text-violet-700 ring-violet-200',
+  split: 'bg-indigo-50 text-indigo-700 ring-indigo-200',
 }
 const cls = computed(() => styles[props.status] ?? styles.received)
 </script>
 <template>
   <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset" :class="cls">
-    {{ status.replace('_', ' ') }}
+    {{ status === 'split' ? 'merged PDF' : status.replace('_', ' ') }}
   </span>
 </template>
