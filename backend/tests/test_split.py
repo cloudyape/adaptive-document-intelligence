@@ -39,6 +39,20 @@ def test_new_letterhead_without_numbers_and_single_quote_pdfs():
     assert ranges(["Invoice\nAcme\nInvoice No: 1\nTotal $5.00"]) == [(1, 1)]
 
 
+def test_handwritten_form_from_another_dealer_after_a_complete_quote():
+    """A typed quote followed by a scanned, handwritten form: OCR finds no title or amounts on the form,
+    only the other dealer's printed letterhead and phone number."""
+    typed = ("Salesperson: Dan 6000 Orange Ave\nCOASTAL KUBOTA Ft. Pierce, FL 772-461-1003\nQUOTE #: 123319 DATE: 03/27/2026\n"
+             "R640R41 WHEEL LOADER $100,740.48 $85,736.57\nTOTAL AMOUNT DUE: $99,623.00")
+    handwritten = ("ELSON Mailing Physical Kubota\nTRACTOR COMPANY, INC. P.O. Box 1999 2934 West Highway 515\n"
+                   "Blairsville, GA 30514 PHONE: (706) 745-2148 FAX: (706) 745-7225\nTE: 6/23/2026 ME: Dustin Gillespie\n"
+                   "Kubota KX040 Finance Target cab heat couplers bucket thumb tax doc fee insurance own")
+    assert ranges([typed, handwritten]) == [(1, 1), (2, 2)]
+    # The same dealer's second page (its own phone again, no new number) stays with the quote
+    page2 = "Coastal Kubota 772-461-1003\nFINANCING OPTIONS\nAsk your salesperson about 0% financing for qualified buyers today"
+    assert ranges([typed, page2]) == [(1, 2)]
+
+
 @pytest.fixture()
 def client(monkeypatch):
     from app.service import process_document

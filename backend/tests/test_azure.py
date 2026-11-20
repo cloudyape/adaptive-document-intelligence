@@ -151,3 +151,36 @@ def test_row_text_rebuilds_rows_from_polygons():
            "pages": [{"words": [word("IGST", 1, 5.0), word("@", 1.6, 5.0), word("18%", 1.9, 5.01), word("10,800.00", 6, 5.02),
                                 word("Grand", 1, 5.3), word("Total", 1.6, 5.31), word("70,800.00", 6, 5.3)]}]}
     assert AnalyzeResult(raw, 1).row_text().splitlines() == ["IGST @ 18% 10,800.00", "Grand Total 70,800.00"]
+
+
+def test_client_retries_throttling_and_dropped_connections(azure):
+    """429 "too many requests" and a TLS EOF (connection dropped by Azure) are retried, not failed."""
+    from app.pipeline.engines.azure_di import AzureClient
+
+    fake, _, _ = azure
+    hiccups = iter(["eof", "429"])
+
+    def flaky(request):
+        step = next(hiccups, None)
+        if step == "eof":
+            raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+        if step == "429":
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        return fake.handler(request)
+
+    result = AzureClient(transport=httpx.MockTransport(flaky), poll_interval=0).analyze("prebuilt-read", b"%PDF-1.7")
+    assert result.content and len(fake.calls) == 3  # submit + two polls, after the two retried failures
+
+    always = httpx.MockTransport(lambda r: httpx.Response(429))
+    with pytest.raises(RuntimeError, match="too many requests"):
+        AzureClient(transport=always, poll_interval=0).analyze("prebuilt-read", b"%PDF-1.7")
+
+
+def test_client_refuses_files_over_the_tier_limit(azure, monkeypatch):
+    from app.pipeline.engines.azure_di import AzureClient
+    from app.pipeline.engines.base import EngineUnavailable
+
+    monkeypatch.setenv("ADI_AZURE_DI_MAX_FILE_MB", "0.001")
+    get_settings.cache_clear()
+    with pytest.raises(EngineUnavailable, match="over the"):
+        AzureClient(transport=azure[1], poll_interval=0).analyze("prebuilt-read", b"x" * 5000)
