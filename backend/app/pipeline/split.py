@@ -6,7 +6,7 @@ evidence, strongest first:
 
 1. A page marker: "Page 1 of 3" / "PAGE 1" starts a quote; "Page 2 of 3" continues one.
 2. The quote / order / invoice number: a different number on the page starts a new quote.
-3. A new letterhead after the previous quote reached its total.
+3. A new letterhead: other company words or another dealer's phone number at the top of the page.
 4. Terms-and-conditions, blank and signature-only pages stay with the quote before them.
 
 When nothing says "new quote", the page stays with the current one: merging two quotes sends the
@@ -34,6 +34,7 @@ APPENDIX = re.compile(r"(terms\s+(?:and|&)\s+conditions|limited\s+warranty|warra
 CONTINUATION = re.compile(r"(finance\s+calculator|trade\s*in\s+description|sales\s+cost\s+sheet|standard\s*equipment|"
                           r"specifications|equipment\s*in\s*standard\s*machine)", re.I)
 WORD = re.compile(r"[a-z]{3,}")
+PHONE = re.compile(r"(?<!\d)(\d{3})[.\-](\d{4})(?!\d)")  # 745-2148: OCR often splits off the area code
 STOP = {"the", "and", "for", "page", "quote", "date", "customer", "phone", "fax", "email", "www", "com", "inc", "llc"}
 
 
@@ -44,6 +45,7 @@ class PageSignals:
     marker: tuple[int, int | None] | None = None  # (page x, of y) printed on the page
     doc_number: str | None = None
     header: set[str] = field(default_factory=set)  # words of the letterhead
+    phones: set[str] = field(default_factory=set)  # phone numbers printed in the letterhead
     titled: bool = False  # says QUOTE / SALES ORDER / INVOICE...
     has_total: bool = False
     money: int = 0  # dollar amounts on the page
@@ -91,6 +93,7 @@ def signals(number: int, text: str) -> PageSignals:
     s.doc_number = number if number and sum(ch.isdigit() for ch in number) >= 4 else None
     head = " ".join(lines[:4]).lower()
     s.header = {w for w in WORD.findall(head) if w not in STOP}
+    s.phones = phones("\n".join(lines[:8]))
     s.titled = bool(TITLE.search(" ".join(lines[:12])))
     s.money = sum(len(money_values(ln)) for ln in lines if "$" in ln)
     s.has_total = any(TOTALISH.search(ln) and money_values(ln) for ln in lines)
@@ -99,6 +102,11 @@ def signals(number: int, text: str) -> PageSignals:
     s.continuation = bool(CONTINUATION.search(" ".join(lines[:6]))) and not s.doc_number and not s.marker
     s.appendix = legal >= 1 and s.money <= 2 and not s.doc_number and (words > 250 or legal >= 2)
     return s
+
+
+def phones(text: str) -> set[str]:
+    """Local part (7 digits) of every phone number in the text."""
+    return {"".join(m.groups()) for m in PHONE.finditer(text)}
 
 
 def _same_number(key: str, keys: set[str]) -> bool:
@@ -163,6 +171,11 @@ def _boundary(cur: list[PageSignals], p: PageSignals) -> str | None:
         return "filled-in quote after an empty form"
     if total_seen and (p.titled or p.money >= 2) and not _similar(first.header, p.header):
         return "new letterhead after a completed quote"
+    # Handwritten / scanned forms rarely OCR into a title or dollar amounts, but the dealer's printed
+    # letterhead phone number does: a letterhead phone the current quote never mentions means another dealer.
+    if (total_seen or first.phones) and p.phones and not _similar(first.header, p.header) and not any(
+            p.phones & phones(q.text) for q in cur):
+        return "another dealer's letterhead (new phone number)"
     if p.titled and p.money >= 2 and not _similar(first.header, p.header) and not _similar(prev.header, p.header):
         return "new letterhead"
     if total_seen and p.titled and p.money >= 2 and p.has_total:

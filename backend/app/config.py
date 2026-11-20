@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     azure_di_invoice_cost_per_page: float = 0.01
     azure_di_highres_cost_per_page: float = 0.006  # add-on, charged on top of the invoice model
     azure_di_timeout_seconds: int = 120
+    # Rate limits: all workers share one pace. F0 (free) allows ~20 requests/min (polls count); S0 allows far more.
+    azure_di_requests_per_minute: int = 15
+    azure_di_poll_seconds: float = 3.0  # wait between "is it done yet?" checks
+    azure_di_max_retries: int = 5  # on 429 / 5xx / dropped connections, with backoff
+    azure_di_max_file_mb: float = 4.0  # F0 rejects files over 4 MB; S0 allows 500 MB
 
     # --- OCR / rendering ---
     tesseract_cmd: str | None = None  # autodetected on PATH when unset

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, replace
 
@@ -64,6 +65,35 @@ class AnalyzeResult:
         return sum(confs) / len(confs) if confs else None
 
 
+class _Pacer:
+    """One shared clock for every Azure call in the process, so all worker threads together stay under the
+    tier's per-minute limit (the free F0 tier allows roughly 20 requests a minute; polls count too)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self, per_minute: int) -> None:
+        if per_minute <= 0:
+            return
+        gap = 60.0 / per_minute
+        with self._lock:
+            now = time.monotonic()
+            at = max(now, self._next)
+            self._next = at + gap
+        if at > now:
+            time.sleep(at - now)
+
+    def back_off(self, seconds: float) -> None:
+        """Azure said "too many requests": hold every thread, not just the one that was refused."""
+        with self._lock:
+            self._next = max(self._next, time.monotonic() + seconds)
+
+
+PACER = _Pacer()
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+
 class AzureClient:
     def __init__(self, transport: httpx.BaseTransport | None = None, poll_interval: float = 1.5):
         s = get_settings()
@@ -73,26 +103,60 @@ class AzureClient:
         self.headers = {"Ocp-Apim-Subscription-Key": s.azure_di_key}
         self.api_version = s.azure_di_api_version
         self.timeout = s.azure_di_timeout_seconds
-        self.poll_interval = poll_interval
+        self.per_minute = s.azure_di_requests_per_minute
+        self.retries = s.azure_di_max_retries
+        self.max_bytes = int(s.azure_di_max_file_mb * 1024 * 1024)
+        self.poll_interval = poll_interval if poll_interval else 0
+        if transport is None:
+            self.poll_interval = max(self.poll_interval, s.azure_di_poll_seconds)
         self._transport = transport
 
+    def _send(self, http: httpx.Client, method: str, url: str, **kw) -> httpx.Response:
+        """One request with pacing and retries. Retries cover throttling (429), Azure-side errors (5xx) and
+        dropped connections (e.g. "SSL: UNEXPECTED_EOF_WHILE_READING"), which Azure does when it sheds load."""
+        delay = 2.0
+        for attempt in range(self.retries + 1):
+            PACER.wait(self.per_minute if self._transport is None else 0)
+            try:
+                resp = http.request(method, url, headers=self.headers, **kw)
+            except httpx.TransportError as exc:  # connection reset / TLS EOF / timeout
+                if attempt == self.retries:
+                    raise RuntimeError(f"Azure DI connection failed after {attempt + 1} tries: {exc}") from exc
+                log.warning("Azure DI %s %s: %s; retrying in %.0fs", method, url.split("?")[0], exc, delay)
+                wait = delay
+            else:
+                if resp.status_code not in RETRY_STATUS:
+                    resp.raise_for_status()
+                    return resp
+                if attempt == self.retries:
+                    reason = "too many requests (rate limit)" if resp.status_code == 429 else f"HTTP {resp.status_code}"
+                    raise RuntimeError(f"Azure DI {reason} after {attempt + 1} tries")
+                try:
+                    wait = max(float(resp.headers.get("Retry-After", delay)), 1.0)
+                except ValueError:
+                    wait = delay
+                if resp.status_code == 429:
+                    PACER.back_off(wait)
+                log.warning("Azure DI HTTP %s; retrying in %.0fs", resp.status_code, wait)
+            if self._transport is None:
+                time.sleep(wait)
+            delay = min(delay * 2, 60)
+        raise AssertionError("unreachable")
+
     def analyze(self, model_id: str, data: bytes, features: list[str] | None = None) -> AnalyzeResult:
+        if self.max_bytes and len(data) > self.max_bytes:
+            raise EngineUnavailable(f"file is {len(data) / 1048576:.1f} MB, over the {self.max_bytes / 1048576:.0f} MB "
+                                    "Azure limit for this tier (ADI_AZURE_DI_MAX_FILE_MB)")
         params = {"api-version": self.api_version}
         if features:
             params["features"] = ",".join(features)
         url = f"{self.base}/documentintelligence/documentModels/{model_id}:analyze"
-        with httpx.Client(timeout=60, transport=self._transport) as http:
-            resp = http.post(url, params=params, headers=self.headers, json={"base64Source": base64.b64encode(data).decode()})
-            if resp.status_code == 429:
-                time.sleep(int(resp.headers.get("Retry-After", "5")))
-                resp = http.post(url, params=params, headers=self.headers, json={"base64Source": base64.b64encode(data).decode()})
-            resp.raise_for_status()
+        with httpx.Client(timeout=httpx.Timeout(120, connect=20), transport=self._transport) as http:
+            resp = self._send(http, "POST", url, params=params, json={"base64Source": base64.b64encode(data).decode()})
             op_url = resp.headers["Operation-Location"]
             deadline = time.monotonic() + self.timeout
             while True:
-                poll = http.get(op_url, headers=self.headers)
-                poll.raise_for_status()
-                body = poll.json()
+                body = self._send(http, "GET", op_url).json()
                 status = body.get("status")
                 if status == "succeeded":
                     break
@@ -100,7 +164,8 @@ class AzureClient:
                     raise RuntimeError(f"Azure DI {model_id} failed: {body.get('error')}")
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"Azure DI {model_id} still '{status}' after {self.timeout}s")
-                time.sleep(float(poll.headers.get("Retry-After", self.poll_interval)) if self.poll_interval else 0)
+                if self.poll_interval:
+                    time.sleep(self.poll_interval)
         result = body.get("analyzeResult") or {}
         return AnalyzeResult(raw=result, pages=len(result.get("pages") or []) or 1)
 
